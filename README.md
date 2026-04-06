@@ -202,15 +202,18 @@ LiteClaw does not call Claude's API directly. It controls Claude Code through tm
 
 ## Summarizer Setup
 
-LiteClaw works without a summarizer — just use `/raw` mode or leave `SUMMARIZER_URL` unconfigured.
+LiteClaw has a 3-tier summarizer that works out of the box — no extra setup needed.
 
-For AI-powered response cleanup, point `SUMMARIZER_URL` to any OpenAI-compatible endpoint:
+**Tier 1: API Proxy** (fastest, 2-3s) — If you have an OpenAI-compatible API endpoint, set `SUMMARIZER_URL`. Options:
+- [claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy) — Use your Claude Max subscription
+- [LiteLLM](https://github.com/BerriAI/litellm) — Proxy to any LLM provider
+- Any OpenAI-compatible endpoint
 
-- **[claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy)** — Exposes your Claude Max subscription as a local OpenAI-compatible API. Run with `docker compose up -d` and set `SUMMARIZER_URL=http://localhost:8080/v1`.
-- **[LiteLLM](https://github.com/BerriAI/litellm)** — Proxy to any LLM provider (OpenAI, Anthropic, Gemini, etc.)
-- Any other OpenAI-compatible endpoint
+**Tier 2: Claude Code Agent** (automatic fallback, 10-20s) — If no API proxy is available, LiteClaw automatically creates a hidden Claude Code session to summarize responses. Since you already have Claude Code installed, this works without any extra setup. Set `SUMMARIZER_AGENT_MODEL` to choose a specific model, or leave empty for default.
 
-Set the model via `SUMMARIZER_MODEL`. The default `claude-haiku-4-5` is fast and inexpensive for cleanup tasks.
+**Tier 3: Raw Output** — If both tiers fail, responses are sent unfiltered. You can also force this with `/raw`.
+
+At startup, LiteClaw probes the API endpoint. If it's unreachable, Tier 2 is pre-warmed automatically.
 
 ---
 

@@ -232,13 +232,18 @@ LiteClaw은 Claude의 API를 직접 호출하지 않습니다. tmux를 통해 Cl
 
 ## 요약기 설정
 
-LiteClaw은 요약기 없이도 충분히 작동합니다 (`/raw` 모드 사용). AI 기반 응답 정리를 원한다면 `SUMMARIZER_URL`을 OpenAI 호환 API로 설정하세요:
+LiteClaw은 3단계 요약기를 내장하고 있어 추가 설정 없이 바로 사용 가능합니다.
 
-- [claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy) — Claude Max 구독을 로컬 API로 노출
-- [LiteLLM](https://github.com/BerriAI/litellm) — 다양한 LLM 프로바이더를 하나의 엔드포인트로 통합
+**Tier 1: API 프록시** (가장 빠름, 2-3초) — OpenAI 호환 API 엔드포인트가 있다면 `SUMMARIZER_URL` 설정:
+- [claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy) — Claude Max 구독 활용
+- [LiteLLM](https://github.com/BerriAI/litellm) — 다양한 LLM 프로바이더 프록시
 - 기타 OpenAI 호환 엔드포인트
 
-요약기에 연결할 수 없거나 타임아웃이 발생하면, LiteClaw은 자동으로 원본 출력을 전송합니다. 요약기 오류로 봇이 중단되지 않습니다.
+**Tier 2: Claude Code 에이전트** (자동 fallback, 10-20초) — API 프록시가 없으면 LiteClaw이 자동으로 숨겨진 Claude Code 세션을 만들어서 응답을 요약합니다. Claude Code가 이미 설치되어 있으므로 추가 설정 불필요. `SUMMARIZER_AGENT_MODEL`로 모델 지정 가능.
+
+**Tier 3: 원본 출력** — 두 단계 모두 실패하면 응답을 그대로 전달합니다. `/raw`로 강제 전환도 가능.
+
+시작 시 LiteClaw이 API 엔드포인트를 자동 확인하고, 연결 불가하면 Tier 2를 미리 준비합니다.
 
 ## 봇 토큰 받기
 

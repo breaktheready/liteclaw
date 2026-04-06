@@ -14,7 +14,7 @@ My solution was pretty basic: a Python script that connects Telegram to a Claude
 
 No API key needed. No extra cost. If you're already paying for Claude Code, this just lets you use it remotely.
 
-Been using it for a couple weeks now. Figured I'd share since people are looking for alternatives.
+It works for what I need, so I figured I'd share it in case others are looking for something similar.
 
 ---
 

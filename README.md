@@ -8,11 +8,13 @@ Control Claude Code CLI remotely via Telegram. No API key needed.
 
 ## Why I made this
 
-I'm not a professional developer — just someone who uses Claude Code daily for my projects. When my remote access setup (OpenClaw) stopped working, I was stuck. I couldn't talk to Claude Code from my phone or while away from my desk.
+I'm not really a programmer — more of a power user who relies on Claude Code daily. When OpenClaw got cut off, I needed a way to keep using Claude Code from my phone.
 
-So I hacked together something simple: a Telegram bot that types into tmux and reads back what's on screen. That's literally all it does. No fancy API calls, no SDK, no cloud services — just `tmux send-keys` and `capture-pane`.
+My solution was pretty basic: a Python script that connects Telegram to a Claude Code session running in tmux. It types your message into the terminal (`send-keys`) and reads back what's on screen (`capture-pane`). That's it.
 
-It's been working well enough for my daily use, so I figured I'd share it. If you're in the same boat — paying for Claude Max but wanting remote access without extra API costs — this might help.
+No API key needed. No extra cost. If you're already paying for Claude Code, this just lets you use it remotely.
+
+Been using it for a couple weeks now. Figured I'd share since people are looking for alternatives.
 
 ---
 

@@ -52,6 +52,8 @@ TMUX_TARGET = os.environ.get("TMUX_TARGET", "claude:1")
 # Summarizer config (local Claude proxy)
 SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://localhost:8080/v1")
 SUMMARIZER_MODEL = os.environ.get("SUMMARIZER_MODEL", "claude-haiku-4-5")
+SUMMARIZER_AGENT_MODEL = os.environ.get("SUMMARIZER_AGENT_MODEL", "")  # model for Tier 2 agent
+SUMMARIZER_AGENT_SESSION = "liteclaw-summarizer"  # hidden tmux session for Tier 2
 
 POLL_INTERVAL = 1.5      # seconds between capture-pane polls
 STABILITY_THRESHOLD = 3   # consecutive unchanged polls = response done
@@ -259,34 +261,6 @@ Rules:
 - Do NOT add your own commentary — just reformat what Claude said"""
 
 
-async def summarize_response(user_question: str, raw_output: str) -> str:
-    """Use Haiku to clean up raw tmux output into a readable Telegram message."""
-    if len(raw_output.strip()) < 50:
-        return raw_output
-
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            resp = await client.post(
-                f"{SUMMARIZER_URL}/chat/completions",
-                headers={"Authorization": "Bearer not-needed"},
-                json={
-                    "model": SUMMARIZER_MODEL,
-                    "messages": [
-                        {"role": "system", "content": SUMMARIZE_PROMPT},
-                        {"role": "user", "content": (
-                            f"User's question:\n{user_question}\n\n"
-                            f"Raw Claude Code output:\n```\n{raw_output[:6000]}\n```"
-                        )},
-                    ],
-                    "max_tokens": 2000,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            return data["choices"][0]["message"]["content"]
-    except Exception as e:
-        log.warning(f"Summarizer failed: {e}, sending raw output")
-        return raw_output
 
 
 # =============================================================================
@@ -301,6 +275,8 @@ class LiteClaw:
         self._pipe_active = False
         self._log_path = ""
         self._log_offset = 0
+        self._summarizer_ready = False  # Tier 2 tmux agent is running
+        self._api_available = None      # None=unknown, True/False after probe
 
     def _auth(self, update: Update) -> bool:
         """Check if message is from authorized chat."""
@@ -363,7 +339,12 @@ class LiteClaw:
     async def cmd_start(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._auth(update):
             return
-        mode = "raw" if self.raw_mode else f"summarized ({SUMMARIZER_MODEL})"
+        if self.raw_mode:
+            mode = "raw"
+        elif self._api_available:
+            mode = f"API ({SUMMARIZER_MODEL})"
+        else:
+            mode = "agent (Tier 2)"
         await update.message.reply_text(
             "🔗 LiteClaw active\n"
             f"Target: `{self.target}` | Mode: {mode}\n\n"
@@ -551,7 +532,7 @@ class LiteClaw:
 
             if response.strip():
                 if not self.raw_mode:
-                    response = await summarize_response(caption or doc.file_name, response)
+                    response = await self._summarize(caption or doc.file_name, response)
                 for chunk in split_message(response):
                     await update.message.reply_text(chunk)
             else:
@@ -601,7 +582,7 @@ class LiteClaw:
 
             if response.strip():
                 if not self.raw_mode:
-                    response = await summarize_response(caption or "photo", response)
+                    response = await self._summarize(caption or "photo", response)
                 for chunk in split_message(response):
                     await update.message.reply_text(chunk)
             else:
@@ -668,7 +649,7 @@ class LiteClaw:
 
             if not self.raw_mode:
                 await ctx.bot.send_chat_action(chat_id=CHAT_ID, action=ChatAction.TYPING)
-                response = await summarize_response(user_text, response)
+                response = await self._summarize(user_text, response)
 
             # Send back
             chunks = split_message(response)
@@ -829,9 +810,191 @@ class LiteClaw:
 
         return "\n".join(response_lines).strip()
 
+    async def _probe_api(self) -> bool:
+        """Check if the API summarizer (Tier 1) is reachable."""
+        try:
+            async with httpx.AsyncClient(timeout=5) as client:
+                resp = await client.get(f"{SUMMARIZER_URL}/models")
+                return resp.status_code == 200
+        except Exception:
+            return False
+
+    async def _ensure_summarizer_agent(self) -> bool:
+        """Ensure the hidden Claude Code summarizer session exists."""
+        if self._summarizer_ready:
+            # Verify session still alive
+            r = subprocess.run(
+                ["tmux", "has-session", "-t", SUMMARIZER_AGENT_SESSION],
+                capture_output=True,
+            )
+            if r.returncode == 0:
+                return True
+            self._summarizer_ready = False
+
+        # Create hidden session with Claude Code
+        try:
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", SUMMARIZER_AGENT_SESSION,
+                 "-x", "200", "-y", "50"],
+                check=True, capture_output=True,
+            )
+            cmd = "claude --dangerously-skip-permissions"
+            if SUMMARIZER_AGENT_MODEL:
+                cmd += f" --model {SUMMARIZER_AGENT_MODEL}"
+            subprocess.run(
+                ["tmux", "send-keys", "-t", SUMMARIZER_AGENT_SESSION, cmd, "Enter"],
+                check=True,
+            )
+            # Wait for Claude to start (check for prompt)
+            for _ in range(15):  # max 15 seconds
+                await asyncio.sleep(1)
+                content = capture_pane(SUMMARIZER_AGENT_SESSION, lines=10)
+                if has_prompt(content):
+                    self._summarizer_ready = True
+                    log.info("Summarizer agent ready (Tier 2)")
+                    return True
+            log.warning("Summarizer agent did not reach prompt in time")
+            return False
+        except Exception as e:
+            log.warning(f"Failed to create summarizer agent: {e}")
+            return False
+
+    async def _summarize_via_agent(self, user_question: str, raw_output: str) -> str | None:
+        """Use hidden Claude Code session to summarize (Tier 2)."""
+        if not await self._ensure_summarizer_agent():
+            return None
+
+        # Build the prompt for Claude Code
+        prompt = (
+            f"Summarize this Claude Code output for a Telegram message. "
+            f"Be concise, keep code blocks, use the same language as the question. "
+            f"User asked: {user_question[:200]}\n\n"
+            f"Output:\n{raw_output[:4000]}"
+        )
+
+        try:
+            # Snapshot before sending
+            pre = capture_pane(SUMMARIZER_AGENT_SESSION, lines=SCROLLBACK_LINES)
+
+            # Send prompt
+            send_keys(SUMMARIZER_AGENT_SESSION, prompt)
+            send_enter(SUMMARIZER_AGENT_SESSION)
+
+            # Poll for response (max 30s)
+            prev_content = ""
+            stable_count = 0
+            await asyncio.sleep(2)
+            elapsed = 2.0
+
+            while elapsed < 30:
+                content = capture_pane(SUMMARIZER_AGENT_SESSION, lines=15)
+                cleaned = content.strip()
+
+                if cleaned == prev_content:
+                    stable_count += 1
+                else:
+                    stable_count = 0
+                prev_content = cleaned
+
+                if stable_count >= STABILITY_THRESHOLD and has_prompt(content):
+                    break
+
+                await asyncio.sleep(POLL_INTERVAL)
+                elapsed += POLL_INTERVAL
+            else:
+                log.warning("Summarizer agent timed out")
+                return None
+
+            # Extract response
+            post = capture_pane(SUMMARIZER_AGENT_SESSION, lines=SCROLLBACK_LINES)
+            result = self._extract_diff(pre, post)
+            return result if result.strip() else None
+
+        except Exception as e:
+            log.warning(f"Summarizer agent error: {e}")
+            return None
+
+    def _extract_diff(self, pre: str, post: str) -> str:
+        """Extract new content added to pane between pre and post snapshots."""
+        pre_lines = pre.strip().split("\n")
+        post_lines = post.strip().split("\n")
+
+        # Find where post diverges from pre
+        common_len = 0
+        for i, (a, b) in enumerate(zip(pre_lines, post_lines)):
+            if a == b:
+                common_len = i + 1
+            else:
+                break
+
+        new_lines = post_lines[common_len:]
+        # Remove trailing prompt lines
+        while new_lines and (not new_lines[-1].strip() or "❯" in new_lines[-1]):
+            new_lines.pop()
+
+        return clean_output("\n".join(new_lines)).strip()
+
+    async def _summarize(self, user_question: str, raw_output: str) -> str:
+        """3-tier summarization: API proxy -> Claude agent -> raw."""
+        if len(raw_output.strip()) < 50:
+            return raw_output
+
+        # Tier 1: API proxy
+        if self._api_available is not False:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(
+                        f"{SUMMARIZER_URL}/chat/completions",
+                        headers={"Authorization": "Bearer not-needed"},
+                        json={
+                            "model": SUMMARIZER_MODEL,
+                            "messages": [
+                                {"role": "system", "content": SUMMARIZE_PROMPT},
+                                {"role": "user", "content": (
+                                    f"User's question:\n{user_question}\n\n"
+                                    f"Raw Claude Code output:\n```\n{raw_output[:6000]}\n```"
+                                )},
+                            ],
+                            "max_tokens": 2000,
+                        },
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    self._api_available = True
+                    return data["choices"][0]["message"]["content"]
+            except Exception as e:
+                log.info(f"Tier 1 (API) failed: {e}, trying Tier 2...")
+                self._api_available = False
+
+        # Tier 2: Claude Code agent in hidden tmux
+        result = await self._summarize_via_agent(user_question, raw_output)
+        if result:
+            return result
+
+        # Tier 3: Raw output
+        log.info("All summarizers failed, returning raw output")
+        return raw_output
+
+    def _cleanup_summarizer(self):
+        """Kill the summarizer tmux session if it exists."""
+        if self._summarizer_ready:
+            subprocess.run(
+                ["tmux", "kill-session", "-t", SUMMARIZER_AGENT_SESSION],
+                capture_output=True,
+            )
+            log.info("Summarizer agent session killed")
+
     def run(self):
         """Start the bot."""
-        app = Application.builder().token(BOT_TOKEN).build()
+        async def on_shutdown(app):
+            self._cleanup_summarizer()
+
+        app = (
+            Application.builder()
+            .token(BOT_TOKEN)
+            .post_shutdown(on_shutdown)
+            .build()
+        )
 
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_start))
@@ -849,6 +1012,18 @@ class LiteClaw:
 
         # Start pipe-pane
         self._start_pipe()
+
+        # Probe Tier 1 API availability
+        import asyncio as _aio
+        loop = _aio.new_event_loop()
+        self._api_available = loop.run_until_complete(self._probe_api())
+        if self._api_available:
+            loop.close()
+            log.info(f"Summarizer: API proxy available at {SUMMARIZER_URL}")
+        else:
+            log.info("Summarizer: API proxy not available, will use Claude Code agent (Tier 2)")
+            loop.run_until_complete(self._ensure_summarizer_agent())
+            loop.close()
 
         log.info(f"Bridge started. Target: {self.target}")
         log.info("Send a message to your Telegram bot to begin.")

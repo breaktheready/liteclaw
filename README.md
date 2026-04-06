@@ -4,32 +4,52 @@ Control Claude Code CLI remotely via Telegram. No API key needed.
 
 [한국어](README_KO.md)
 
-## What is LiteClaw?
+---
 
-LiteClaw is a lightweight bridge between Telegram and Claude Code CLI. It lets you interact with Claude Code from your phone — send messages, receive AI-summarized responses, transfer files, and monitor progress.
+## Why I made this
 
-No additional API keys or subscriptions required. If you have Claude Code running in tmux, LiteClaw connects your Telegram to it.
+I'm not a professional developer — just someone who uses Claude Code daily for my projects. When my remote access setup (OpenClaw) stopped working, I was stuck. I couldn't talk to Claude Code from my phone or while away from my desk.
+
+So I hacked together something simple: a Telegram bot that types into tmux and reads back what's on screen. That's literally all it does. No fancy API calls, no SDK, no cloud services — just `tmux send-keys` and `capture-pane`.
+
+It's been working well enough for my daily use, so I figured I'd share it. If you're in the same boat — paying for Claude Max but wanting remote access without extra API costs — this might help.
+
+---
+
+## How is this different?
+
+Unlike tools that call Claude's API directly (which means extra costs), LiteClaw operates your **existing Claude Code CLI session** through tmux. You're already paying for Claude Max — this just lets you use it from your phone.
+
+- Single Python file (~900 lines), not a framework
+- No API keys to Anthropic needed
+- No containers, no Docker
+- Your subscription covers everything
 
 ## Features
 
 - **Remote access** — Control Claude Code from anywhere via Telegram
-- **AI summarization** — Responses cleaned up by Haiku before delivery (toggleable)
-- **Busy detection** — Knows when Claude is working, queues your message
-- **Progress updates** — See what Claude is doing while it works
-- **File transfer** — Send and receive files through Telegram
-- **Multi-target** — Switch between tmux sessions on the fly
+- **AI summarization** — Responses cleaned up by an LLM before delivery (toggleable)
+- **Busy detection** — Knows when Claude is working, queues your message automatically
+- **Progress updates** — Periodic status messages while Claude works on long tasks
+- **File transfer** — Send files to the server and download results back to Telegram
+- **Multi-target** — Switch between tmux sessions and windows on the fly
+- **Photo upload** — Send photos for Claude's vision tasks
+
+---
 
 ## Quick Start
 
-### Prerequisites
+### Primary method: setup script
 
-- Python 3.10+
-- tmux 3.0+
-- Claude Code CLI installed
-- A Telegram bot token ([get one from @BotFather](https://t.me/BotFather))
-- (Optional) OpenAI-compatible API endpoint for summarization
+```bash
+git clone https://github.com/breaktheready/liteclaw.git
+cd liteclaw
+bash setup.sh
+```
 
-### Installation
+The setup script creates the virtual environment, installs dependencies, and copies `.env.example` to `.env`.
+
+### Manual installation
 
 ```bash
 git clone https://github.com/breaktheready/liteclaw.git
@@ -37,98 +57,283 @@ cd liteclaw
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-### Configuration
-
-```bash
 cp .env.example .env
 ```
 
-Edit `.env`:
-```
-BOT_TOKEN=your-telegram-bot-token
-CHAT_ID=your-telegram-chat-id
+### Configure
+
+Edit `.env` and set the required values:
+
+```env
+BOT_TOKEN=your_bot_token_here
+CHAT_ID=your_numeric_chat_id_here
 TMUX_TARGET=claude:1
 ```
 
-### Run
+### Start Claude Code in tmux
 
 ```bash
-# Terminal 1: Start Claude Code
 tmux new-session -s claude 'claude --dangerously-skip-permissions'
+```
 
-# Terminal 2: Start LiteClaw
+### Run LiteClaw
+
+```bash
 source .venv/bin/activate
 python3 liteclaw.py
 ```
+
+Send `/start` to your Telegram bot to confirm it is working.
+
+---
+
+## Configuration
+
+All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BOT_TOKEN` | (required) | Telegram bot token from @BotFather |
+| `CHAT_ID` | (required) | Your numeric Telegram user ID |
+| `TMUX_TARGET` | `claude:1` | Target tmux session and window (`SESSION:WINDOW.PANE`) |
+| `SUMMARIZER_URL` | `http://localhost:8080/v1` | OpenAI-compatible API endpoint for summarization |
+| `SUMMARIZER_MODEL` | `claude-haiku-4-5` | Model to use for response cleanup |
+| `SCROLLBACK_LINES` | `500` | Number of tmux history lines to capture per poll |
+| `INTERMEDIATE_INTERVAL` | `10` | Seconds between progress updates while Claude works |
+| `STAGING_DIR` | `~/liteclaw-files` | Directory where uploaded files are saved on the server |
+| `EXTRA_PROMPT_PATTERNS` | (empty) | Comma-separated regex patterns for custom prompt detection |
+
+---
 
 ## Commands
 
 | Command | Description |
 |---------|-------------|
-| Any text | Send to Claude Code |
-| `/status` | Show last 30 lines of Claude's output |
-| `/target SESSION:WIN.PANE` | Switch tmux target |
-| `/cancel` | Send Ctrl+C to Claude |
-| `/sessions` | List all tmux sessions |
-| `/escape` | Send Escape key |
-| `/raw` | Toggle raw/summarized output |
-| `/model MODEL` | Change summarizer model |
-| `/get FILEPATH` | Download a file from server |
-| Send a file | Upload to server and relay to Claude |
-| Send a photo | Save photo and relay path to Claude |
+| Any text | Relay text directly to Claude Code and return the response |
+| `/start` or `/help` | Show available commands and current configuration |
+| `/status` | Display the last 30 lines of Claude's current tmux pane |
+| `/target SESSION:WIN.PANE` | Switch to a different tmux target (e.g. `/target work:0`) |
+| `/cancel` | Send Ctrl+C to interrupt Claude's current task |
+| `/escape` | Send the Escape key (useful for exiting Claude modal dialogs) |
+| `/raw` | Toggle between summarized and raw output |
+| `/model MODEL_NAME` | Change the summarizer model (e.g. `/model claude-sonnet-4-6`) |
+| `/sessions` | List all active tmux sessions |
+| `/get FILEPATH` | Download a file from the server to Telegram |
+| Send a document | Upload a file to `STAGING_DIR` and relay its path (and contents for small files) to Claude |
+| Send a photo | Upload a photo to `STAGING_DIR` and relay the path to Claude for vision tasks |
+
+### Command details
+
+**Any text message** — LiteClaw checks if Claude is idle, injects your message into the tmux pane, polls for a response, optionally runs it through the summarizer, and sends it back. Long responses are split into 4000-character chunks automatically.
+
+**`/status`** — Shows raw pane content without filtering. Useful for checking what Claude is doing mid-task or diagnosing prompt detection issues.
+
+**`/target`** — Switches the active tmux target without restarting the bot. Accepts any valid tmux target format: `session`, `session:window`, or `session:window.pane`.
+
+**`/cancel`** — Sends a SIGINT (Ctrl+C) to the active pane. Use this to abort a long-running Claude task before sending a new message.
+
+**`/escape`** — Sends the Escape key sequence. Useful for closing Claude's permission dialogs or exiting selection mode.
+
+**`/raw`** — Toggles raw mode. When enabled, responses are sent unfiltered (terminal noise and all). When disabled (default), the summarizer removes noise and formats the response for readability.
+
+**`/model`** — Changes the summarizer model at runtime. Takes effect immediately for the next response.
+
+**`/sessions`** — Runs `tmux list-sessions` and sends the output. Helps when you need to find the right session name for `/target`.
+
+**`/get`** — Downloads a file from the server. Relative paths are resolved from the tmux pane's working directory. Absolute paths work as-is. Maximum 50 MB.
+
+---
+
+## File Transfer
+
+### Upload (document or photo)
+
+Send any file as a Telegram document attachment (up to 50 MB), or send a photo directly from your camera or gallery.
+
+LiteClaw will:
+1. Save the file to `STAGING_DIR` on the server
+2. If the file is a small text file (under ~50 KB), embed its contents in the message to Claude
+3. Otherwise, relay the file path so Claude can read it directly
+4. Send Claude's response back to Telegram
+
+Add a caption to your file to pass instructions alongside it. For example:
+
+```
+Caption: "Summarize the key findings in this report"
+```
+
+For photos, the caption is relayed as the prompt for Claude's vision capabilities.
+
+### Download with `/get`
+
+```
+/get results.txt
+/get ~/projects/output.json
+/get /tmp/analysis_20260405.csv
+```
+
+The file is fetched and sent back as a Telegram document. Relative paths resolve from the tmux pane's current working directory.
+
+---
 
 ## How It Works
 
 ```
-You (Telegram) → LiteClaw → tmux send-keys → Claude Code CLI
-                                                    ↓
-You (Telegram) ← Haiku summary ← capture-pane ← Response
+You (Telegram) --> LiteClaw --> tmux send-keys --> Claude Code CLI
+                                                        |
+You (Telegram) <-- Summarizer <-- capture-pane <-- Response
 ```
 
-1. You send a message on Telegram
-2. LiteClaw checks if Claude is idle or busy
-3. Injects your message into the tmux pane via `send-keys`
-4. Polls `capture-pane` every 1.5s until response stabilizes
-5. Optionally summarizes via Haiku (or any OpenAI-compatible API)
-6. Sends the clean response back to Telegram
+1. Your message arrives at the Telegram bot
+2. LiteClaw checks if Claude is idle (prompt visible) or busy
+3. If idle, the message is injected into the tmux pane via `send-keys`
+4. LiteClaw polls `capture-pane` every 1.5 seconds
+5. When the pane content stabilizes and a prompt reappears, the response is ready
+6. The response is optionally passed through the summarizer to remove terminal noise
+7. The clean response is split into chunks and sent back to Telegram
 
-## Configuration Reference
+### No API Key Required
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `BOT_TOKEN` | (required) | Telegram bot token from @BotFather |
-| `CHAT_ID` | (required) | Your Telegram chat ID |
-| `TMUX_TARGET` | `claude:1` | tmux target pane |
-| `SUMMARIZER_URL` | `http://localhost:8080/v1` | OpenAI-compatible API endpoint |
-| `SUMMARIZER_MODEL` | `claude-haiku-4-5` | Model for summarization |
-| `SCROLLBACK_LINES` | `500` | Lines to capture from tmux |
-| `INTERMEDIATE_INTERVAL` | `10` | Seconds between progress updates |
-| `STAGING_DIR` | `~/liteclaw-files` | Directory for file uploads |
-| `EXTRA_PROMPT_PATTERNS` | (empty) | Comma-separated regex patterns for custom prompt detection |
+LiteClaw does not call Claude's API directly. It controls Claude Code through tmux using your existing Claude Code subscription. Summarization is handled by a local OpenAI-compatible proxy (optional). If the summarizer is unavailable, LiteClaw falls back to raw output automatically.
+
+---
 
 ## Summarizer Setup
 
-LiteClaw works without a summarizer (`/raw` mode). For AI-powered response cleanup, point `SUMMARIZER_URL` to any OpenAI-compatible API:
+LiteClaw works without a summarizer — just use `/raw` mode or leave `SUMMARIZER_URL` unconfigured.
 
-- [claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy) — Use your Claude Max subscription
-- [LiteLLM](https://github.com/BerriAI/litellm) — Proxy to any LLM provider
-- Any OpenAI-compatible endpoint
+For AI-powered response cleanup, point `SUMMARIZER_URL` to any OpenAI-compatible endpoint:
+
+- **[claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy)** — Exposes your Claude Max subscription as a local OpenAI-compatible API. Run with `docker compose up -d` and set `SUMMARIZER_URL=http://localhost:8080/v1`.
+- **[LiteLLM](https://github.com/BerriAI/litellm)** — Proxy to any LLM provider (OpenAI, Anthropic, Gemini, etc.)
+- Any other OpenAI-compatible endpoint
+
+Set the model via `SUMMARIZER_MODEL`. The default `claude-haiku-4-5` is fast and inexpensive for cleanup tasks.
+
+---
+
+## Getting Your Bot Token
+
+1. Open Telegram and search for `@BotFather`
+2. Send `/newbot`
+3. Choose a display name for your bot (e.g. "My Claude Bot")
+4. Choose a username ending in `bot` (e.g. `my_claude_bot`)
+5. BotFather will return a token like `123456789:ABCdef...`
+6. Copy the token to `.env` as `BOT_TOKEN`
+
+---
+
+## Getting Your Chat ID
+
+1. Open Telegram and search for `@userinfobot`
+2. Send any message
+3. It will reply with your numeric user ID — copy it to `.env` as `CHAT_ID`
+
+---
+
+## Security
+
+**Bot token** — Stored only in `.env`, which is gitignored by default. Never hardcode your token in source code or share it publicly. Anyone with your bot token can send messages as your bot.
+
+**Authentication** — Only messages from the Telegram user ID configured as `CHAT_ID` are processed. All other users are silently ignored. This is a single-user tool by design.
+
+**tmux access** — LiteClaw has direct, unsandboxed access to your tmux session. It can inject arbitrary keystrokes. Secure your server with appropriate access controls — LiteClaw itself does not add any authentication beyond the Telegram chat ID check.
+
+**`--dangerously-skip-permissions`** — This flag disables Claude Code's permission prompts, auto-approving all file writes, shell commands, and other actions. Only use this in trusted environments where you understand the implications.
+
+**Network** — LiteClaw connects only to the Telegram API (for receiving and sending messages) and optionally to your local summarizer endpoint. No user data is sent to external servers beyond Telegram's own infrastructure.
+
+---
 
 ## Troubleshooting
 
-**"Conflict: terminated by other getUpdates request"**
-Another process is using the same bot token. Stop it first.
+**"tmux session not found"**
+The tmux session in `TMUX_TARGET` does not exist. Start Claude Code first:
+```bash
+tmux new-session -s claude 'claude --dangerously-skip-permissions'
+```
+Then update `TMUX_TARGET` in `.env` to match your session name.
+
+**"Still processing / Use /cancel to abort"**
+Claude is busy. LiteClaw queues your message but warns you. Send `/cancel` to interrupt the current task, then retry.
 
 **No response from Claude**
-Check if Claude is at the `❯` prompt: `/status`
+Run `/status` to see Claude's current pane content. If you do not see the `❯` prompt, Claude may be waiting for input or stuck. If you use a custom shell prompt, add its pattern to `EXTRA_PROMPT_PATTERNS` in `.env`.
 
-**Garbled output in messages**
-Make sure you're not in `/raw` mode. The summarizer cleans up terminal noise.
+**Garbled or incomplete output**
+Claude may have still been rendering when LiteClaw captured the response. Try `/raw` to see unfiltered output. If the issue is consistent, increase `SCROLLBACK_LINES` in `.env`.
 
-**"tmux session not found"**
-Start Claude Code in tmux first: `tmux new-session -s claude`
+**"Conflict: terminated by other getUpdates request"**
+Another process is already polling the same bot token. Find and stop it:
+```bash
+ps aux | grep liteclaw.py
+pkill -f liteclaw.py
+```
+Then restart LiteClaw.
+
+**Summarizer requests timeout**
+The summarizer proxy is slow or unreachable. Switch to raw mode with `/raw`, or verify the proxy is running and `SUMMARIZER_URL` is correct.
+
+---
+
+## Production Deployment
+
+### Persistent tmux session
+
+Run LiteClaw inside its own tmux session so it survives terminal disconnects:
+
+```bash
+tmux new-session -d -s liteclaw -c /path/to/liteclaw \
+  '.venv/bin/python3 liteclaw.py'
+```
+
+Monitor it with:
+
+```bash
+tmux attach -t liteclaw
+```
+
+### systemd service
+
+For automatic startup and restart on failure, create a systemd unit file:
+
+```ini
+[Unit]
+Description=LiteClaw Telegram-Claude Bridge
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/path/to/liteclaw
+ExecStart=/path/to/liteclaw/.venv/bin/python3 liteclaw.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install and enable:
+
+```bash
+sudo cp liteclaw.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now liteclaw
+```
+
+---
+
+## Disclaimer
+
+LiteClaw is a personal project shared as-is for the community.
+
+- **Use at your own risk.** The author is not responsible for any damage, data loss, or security issues arising from use of this software.
+- This tool controls Claude Code via tmux. Ensure your server and tmux sessions are properly secured.
+- Bot token and chat ID security is your responsibility. Never share your `.env` file.
+- This project is not affiliated with, endorsed by, or sponsored by Anthropic.
+
+---
 
 ## License
 

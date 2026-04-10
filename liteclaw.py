@@ -122,6 +122,8 @@ NOISE_PATTERNS = [
     r"Ran \d+ stop hook",            # stop hook notifications
     r"Stop hook prevented",           # stop hook prevented
     r"✻ Brewed for",                 # brew time indicator
+    r"✻ Churned for",                 # churn time indicator
+    r"session:\d+m",                  # OMC session timer (changes every second)
     r"ctrl\+o to expand",            # expand hint
     r"shift\+tab to cycle",          # mode cycle hint
     r"Keel\s*$",                     # Keel mascot name
@@ -974,6 +976,7 @@ class LiteClaw:
         """Poll an agent's tmux session until response stabilizes."""
         prev_content = ""
         stable_count = 0
+        prompt_count = 0  # consecutive polls where prompt is visible
         elapsed = 0.0
         last_typing = 0.0
         last_status = 0.0
@@ -994,13 +997,19 @@ class LiteClaw:
 
             # Prompt detection via capture-pane
             pane_content = capture_pane(session, lines=15)
-            cleaned = pane_content.strip()
+            cleaned = clean_output(pane_content).strip()
 
             if cleaned == prev_content:
                 stable_count += 1
             else:
                 stable_count = 0
             prev_content = cleaned
+
+            # Track consecutive prompt detections
+            if has_prompt(pane_content):
+                prompt_count += 1
+            else:
+                prompt_count = 0
 
             # Status update at adaptive interval
             if elapsed - last_status >= status_interval:
@@ -1027,8 +1036,9 @@ class LiteClaw:
                 last_status = elapsed
                 status_interval = min(status_interval + 5, 60)
 
-            # Done: stable AND prompt visible
-            if stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content):
+            # Done: (stable AND prompt visible) OR prompt visible for 3+ consecutive polls
+            if (stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content)) or prompt_count >= 3:
+                log.info(f"Agent poll complete after {elapsed:.1f}s (stable_count={stable_count}, prompt_count={prompt_count})")
                 break
 
             await asyncio.sleep(POLL_INTERVAL)
@@ -1257,38 +1267,139 @@ class LiteClaw:
             # Poll for response with streaming feedback
             response = await self._poll_response(ctx.bot, user_text)
 
-            # Summarize (unless raw mode)
-            if not response.strip():
-                await update.message.reply_text("(empty response)")
-                return
-
-            if not self.raw_mode:
-                await ctx.bot.send_chat_action(chat_id=CHAT_ID, action=ChatAction.TYPING)
-                response = await self._summarize(user_text, response)
-
-            # Send back
-            chunks = split_message(response)
-            for i, chunk in enumerate(chunks):
-                if len(chunks) > 1:
-                    header = f"[{i+1}/{len(chunks)}]\n"
-                else:
-                    header = ""
-                await update.message.reply_text(f"{header}{chunk}")
-                if i < len(chunks) - 1:
-                    await asyncio.sleep(0.5)
+            # Deliver response (with persistent retry)
+            await self._deliver_response(response, user_text, update, ctx)
 
         except RuntimeError as e:
             await update.message.reply_text(f"Error: {e}")
         except Exception as e:
-            log.exception("Unexpected error")
-            await update.message.reply_text(f"Unexpected error: {e}")
+            log.exception("Unexpected error in handle_message")
+            # Last resort: try to extract and deliver whatever Claude has
+            try:
+                full_capture = capture_pane(self.target, lines=SCROLLBACK_LINES)
+                if has_prompt(full_capture):
+                    response = self._extract_response(full_capture, user_text)
+                    if response.strip():
+                        log.info("Recovering response after error...")
+                        await self._deliver_response(response, user_text, update, ctx)
+                    else:
+                        await update.message.reply_text("(응답 추출 실패 — /status로 확인)")
+                else:
+                    await update.message.reply_text("⏳ Claude 아직 작업 중. 완료되면 알림 드립니다.")
+                    # Keep polling in background until done
+                    asyncio.create_task(self._background_deliver(user_text, ctx.bot))
+            except Exception:
+                pass
         finally:
             self.busy = False
+
+    async def _deliver_response(self, response: str, user_text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Deliver response to Telegram with retry. Summarizes unless raw mode."""
+        if not response.strip():
+            await update.message.reply_text("(empty response)")
+            return
+
+        if not self.raw_mode:
+            try:
+                await ctx.bot.send_chat_action(chat_id=CHAT_ID, action=ChatAction.TYPING)
+            except Exception:
+                pass
+            log.info("Summarizer starting")
+            try:
+                response = await asyncio.wait_for(
+                    self._summarize(user_text, response),
+                    timeout=45.0,
+                )
+                log.info(f"Summarizer completed: {len(response)} chars")
+            except asyncio.TimeoutError:
+                log.warning("Summarizer timed out (45s), sending raw output")
+                # response stays as raw — do not modify it
+
+        chunks = split_message(response)
+        log.info(f"Delivering response: {len(response)} chars in {len(chunks)} chunk(s)")
+        for i, chunk in enumerate(chunks):
+            header = f"[{i+1}/{len(chunks)}]\n" if len(chunks) > 1 else ""
+            for attempt in range(3):
+                try:
+                    await update.message.reply_text(f"{header}{chunk}")
+                    log.info(f"Delivery success: chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
+                    break
+                except Exception as e:
+                    if attempt < 2:
+                        log.warning(f"Telegram send retry {attempt+1}: {e}")
+                        await asyncio.sleep(2 ** attempt)
+                    else:
+                        # Final fallback: direct API send (bypasses bot timeout settings)
+                        log.warning(f"Telegram bot send failed 3x, using direct API fallback")
+                        try:
+                            async with httpx.AsyncClient(timeout=60) as client:
+                                await client.post(
+                                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                    json={"chat_id": CHAT_ID, "text": f"{header}{chunk}"},
+                                )
+                            log.info(f"Direct API fallback success: chunk {i+1}/{len(chunks)}")
+                        except Exception as e2:
+                            log.error(f"Direct API send also failed: {e2}")
+            if i < len(chunks) - 1:
+                await asyncio.sleep(0.5)
+
+    async def _background_deliver(self, user_text: str, bot):
+        """Background task: wait for Claude to finish, then deliver response."""
+        log.info("Background delivery started — waiting for Claude to finish")
+        elapsed = 0.0
+        prompt_count = 0  # consecutive polls where prompt is visible
+        while elapsed < 1800:  # max 30 minutes
+            await asyncio.sleep(5)
+            elapsed += 5
+            try:
+                pane = capture_pane(self.target, lines=15)
+                if has_prompt(pane):
+                    prompt_count += 1
+                else:
+                    prompt_count = 0
+                    continue
+
+                # Need 2+ consecutive prompt detections (10s) to confirm done
+                if prompt_count < 2:
+                    continue
+
+                full = capture_pane(self.target, lines=SCROLLBACK_LINES)
+                response = self._extract_response(full, user_text)
+                if response.strip():
+                    if not self.raw_mode:
+                        log.info("Background delivery: summarizer starting")
+                        try:
+                            response = await asyncio.wait_for(
+                                self._summarize(user_text, response),
+                                timeout=45.0,
+                            )
+                            log.info(f"Background delivery: summarizer completed: {len(response)} chars")
+                        except asyncio.TimeoutError:
+                            log.warning("Background delivery: summarizer timed out, sending raw")
+                    for chunk in split_message(response):
+                        try:
+                            await bot.send_message(chat_id=CHAT_ID, text=chunk)
+                            log.info(f"Background delivery: sent chunk ({len(chunk)} chars)")
+                        except Exception:
+                            log.warning("Background delivery: bot send failed, using direct API")
+                            async with httpx.AsyncClient(timeout=60) as client:
+                                await client.post(
+                                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                    json={"chat_id": CHAT_ID, "text": chunk},
+                                )
+                    log.info(f"Background delivery complete: {len(response)} chars")
+                self.busy = False
+                return
+            except Exception as e:
+                log.warning(f"Background delivery check failed: {e}")
+        log.warning("Background delivery timeout (30min)")
+        self.busy = False
 
     async def _poll_response(self, bot, user_text: str = "") -> str:
         """Poll until response stabilizes. Uses pipe-pane log for output, capture-pane for prompt detection."""
         prev_content = ""
         stable_count = 0
+        prompt_count = 0  # consecutive polls where prompt is visible
         elapsed = 0.0
         last_typing = 0.0
         last_status = 0.0
@@ -1309,13 +1420,20 @@ class LiteClaw:
 
             # Prompt detection via capture-pane (small window, fast)
             pane_content = capture_pane(self.target, lines=15)
-            cleaned = pane_content.strip()
+            # Compare cleaned content (strips OMC status bar and other noise that changes every second)
+            cleaned = clean_output(pane_content).strip()
 
             if cleaned == prev_content:
                 stable_count += 1
             else:
                 stable_count = 0
             prev_content = cleaned
+
+            # Track consecutive prompt detections (belt-and-suspenders)
+            if has_prompt(pane_content):
+                prompt_count += 1
+            else:
+                prompt_count = 0
 
             # Status update at adaptive interval — show last few meaningful lines
             if elapsed - last_status >= status_interval:
@@ -1342,8 +1460,9 @@ class LiteClaw:
                 last_status = elapsed
                 status_interval = min(status_interval + 5, 60)
 
-            # Done: stable AND prompt visible
-            if stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content):
+            # Done: (stable AND prompt visible) OR prompt visible for 3+ consecutive polls
+            if (stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content)) or prompt_count >= 3:
+                log.info(f"Poll complete after {elapsed:.1f}s (stable_count={stable_count}, prompt_count={prompt_count})")
                 break
 
             await asyncio.sleep(POLL_INTERVAL)
@@ -1561,9 +1680,10 @@ class LiteClaw:
             await asyncio.sleep(2)
             elapsed = 2.0
 
+            prompt_count = 0
             while elapsed < 30:
                 content = capture_pane(SUMMARIZER_AGENT_SESSION, lines=15)
-                cleaned = content.strip()
+                cleaned = clean_output(content).strip()
 
                 if cleaned == prev_content:
                     stable_count += 1
@@ -1571,7 +1691,12 @@ class LiteClaw:
                     stable_count = 0
                 prev_content = cleaned
 
-                if stable_count >= STABILITY_THRESHOLD and has_prompt(content):
+                if has_prompt(content):
+                    prompt_count += 1
+                else:
+                    prompt_count = 0
+
+                if (stable_count >= STABILITY_THRESHOLD and has_prompt(content)) or prompt_count >= 3:
                     break
 
                 await asyncio.sleep(POLL_INTERVAL)
@@ -1697,6 +1822,9 @@ class LiteClaw:
             Application.builder()
             .token(BOT_TOKEN)
             .post_shutdown(on_shutdown)
+            .read_timeout(30)
+            .write_timeout(30)
+            .connect_timeout(15)
             .build()
         )
 

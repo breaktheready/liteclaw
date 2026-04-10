@@ -19,12 +19,16 @@ Usage:
 
 import asyncio
 import html
+import json as _json
 import logging
 import os
 import re
 import subprocess
 import sys
+import threading
 from datetime import datetime
+from functools import partial
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 
 import httpx
@@ -63,6 +67,9 @@ TG_MAX_LEN = 4000         # telegram message length (leave buffer from 4096)
 
 # pipe-pane log directory
 PIPE_LOG_DIR = os.environ.get("PIPE_LOG_DIR", "/tmp")
+
+# Dashboard
+DASHBOARD_PORT = int(os.environ.get("DASHBOARD_PORT", "7777"))
 
 # Intermediate streaming config
 INTERMEDIATE_INTERVAL = int(os.environ.get("INTERMEDIATE_INTERVAL", "10"))
@@ -157,7 +164,18 @@ def capture_pane(target: str, lines: int = SCROLLBACK_LINES) -> str:
 
 
 def send_keys(target: str, text: str, literal: bool = True):
-    """Send keystrokes to tmux pane."""
+    """Send keystrokes to tmux pane. Long text (>500 chars) is saved to a temp
+    file and the path is sent instead, to avoid tmux bracketed paste issues."""
+    if literal and len(text) > 500:
+        # Long text breaks tmux send-keys (shows as "[Pasted text +N lines]")
+        # Save to file and tell Claude to read it
+        tmp = f"/tmp/liteclaw_input_{int(datetime.now().timestamp())}.txt"
+        Path(tmp).write_text(text, encoding="utf-8")
+        msg = f"Read this file and follow the instructions inside: {tmp}"
+        cmd = ["tmux", "send-keys", "-t", target, "-l", msg]
+        subprocess.run(cmd, check=True)
+        log.info(f"Long input ({len(text)} chars) saved to {tmp}")
+        return
     cmd = ["tmux", "send-keys", "-t", target]
     if literal:
         cmd.append("-l")
@@ -252,15 +270,227 @@ def format_for_telegram(text: str) -> str:
 SUMMARIZE_PROMPT = """You are a concise assistant that reformats Claude Code CLI output for Telegram.
 
 Rules:
-- Extract the meaningful response, discard terminal noise (tool calls, file reads, status lines)
-- Keep code blocks, commands, and key decisions intact
+- Extract the meaningful response, discard terminal noise (tool calls, file reads, status lines, hook messages)
+- Keep code blocks, commands, key decisions, and action items intact
 - Use Telegram-friendly Markdown (bold, code blocks, bullet points)
 - Respond in the same language as the user's question
 - If the output contains an error, highlight it clearly
-- Keep it concise but don't lose important details
+- For long outputs: summarize into structured sections with headers, don't just truncate
+- If the output contains a plan or list: preserve the structure and all items
+- Keep it concise but NEVER drop important content — completeness over brevity
 - Do NOT add your own commentary — just reformat what Claude said"""
 
 
+
+
+# =============================================================================
+# Dashboard
+# =============================================================================
+
+class DashboardHandler(BaseHTTPRequestHandler):
+    """Minimal HTTP dashboard for LiteClaw settings."""
+
+    def __init__(self, bridge, *args, **kwargs):
+        self.bridge = bridge
+        super().__init__(*args, **kwargs)
+
+    def log_message(self, format, *args):
+        pass  # suppress default logging
+
+    def _send_json(self, data, status=200):
+        body = _json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html_content):
+        body = html_content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path == "/api/config":
+            self._send_json({
+                "summarizer_model": SUMMARIZER_MODEL,
+                "tmux_target": self.bridge.target,
+                "raw_mode": self.bridge.raw_mode,
+                "scrollback_lines": SCROLLBACK_LINES,
+                "poll_interval": POLL_INTERVAL,
+                "dashboard_port": DASHBOARD_PORT,
+            })
+        elif self.path == "/api/status":
+            self._send_json({
+                "busy": self.bridge.busy,
+                "target": self.bridge.target,
+                "raw_mode": self.bridge.raw_mode,
+                "api_available": self.bridge._api_available,
+                "pipe_active": self.bridge._pipe_active,
+                "last_activity": getattr(self.bridge, '_last_activity', None),
+            })
+        elif self.path == "/api/logs":
+            try:
+                log_path = self.bridge._get_log_path() if self.bridge._pipe_active else ""
+                recent = []
+                if log_path and os.path.exists(log_path):
+                    with open(log_path, "r", errors="replace") as f:
+                        lines = f.readlines()
+                        recent = [l.rstrip() for l in lines[-20:]]
+                self._send_json({"lines": recent})
+            except Exception as e:
+                self._send_json({"lines": [], "error": str(e)})
+        elif self.path == "/":
+            self._send_html(DASHBOARD_HTML)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == "/api/config":
+            try:
+                length = int(self.headers.get("Content-Length", 0))
+                body = _json.loads(self.rfile.read(length)) if length else {}
+                global SUMMARIZER_MODEL
+                if "summarizer_model" in body:
+                    SUMMARIZER_MODEL = body["summarizer_model"]
+                if "raw_mode" in body:
+                    self.bridge.raw_mode = bool(body["raw_mode"])
+                if "tmux_target" in body:
+                    old = self.bridge.target
+                    self.bridge.target = body["tmux_target"]
+                    if old != self.bridge.target and self.bridge._pipe_active:
+                        self.bridge._stop_pipe()
+                        self.bridge._start_pipe()
+                self._send_json({"ok": True})
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=400)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+
+DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LiteClaw Dashboard</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0f172a; color: #e2e8f0; padding: 20px; max-width: 640px; margin: 0 auto; }
+  h1 { font-size: 1.5rem; margin-bottom: 20px; color: #38bdf8; }
+  .card { background: #1e293b; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 0.9rem; color: #94a3b8; margin-bottom: 12px; text-transform: uppercase; letter-spacing: 1px; }
+  .row { display: flex; justify-content: space-between; align-items: center; padding: 8px 0; border-bottom: 1px solid #334155; }
+  .row:last-child { border-bottom: none; }
+  .label { color: #94a3b8; font-size: 0.85rem; }
+  .value { color: #f1f5f9; font-weight: 500; }
+  select, input[type=text] { background: #334155; color: #f1f5f9; border: 1px solid #475569; border-radius: 4px; padding: 6px 10px; font-size: 0.85rem; }
+  button { background: #2563eb; color: white; border: none; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 0.85rem; }
+  button:hover { background: #1d4ed8; }
+  .toggle { position: relative; width: 44px; height: 24px; background: #475569; border-radius: 12px; cursor: pointer; transition: background 0.2s; }
+  .toggle.on { background: #22c55e; }
+  .toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; background: white; border-radius: 50%; transition: left 0.2s; }
+  .toggle.on::after { left: 22px; }
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-dot.idle { background: #22c55e; }
+  .status-dot.busy { background: #f59e0b; animation: pulse 1s infinite; }
+  @keyframes pulse { 50% { opacity: 0.5; } }
+  .logs { background: #0f172a; border-radius: 4px; padding: 10px; font-family: monospace; font-size: 0.75rem; color: #94a3b8; max-height: 200px; overflow-y: auto; white-space: pre-wrap; word-break: break-all; }
+  .footer { text-align: center; color: #475569; font-size: 0.75rem; margin-top: 20px; }
+</style>
+</head>
+<body>
+<h1>LiteClaw Dashboard</h1>
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="row"><span class="label">State</span><span class="value" id="state"><span class="status-dot idle"></span>Loading...</span></div>
+  <div class="row"><span class="label">Target</span><span class="value" id="target">-</span></div>
+  <div class="row"><span class="label">API Proxy</span><span class="value" id="api">-</span></div>
+</div>
+
+<div class="card">
+  <h2>Settings</h2>
+  <div class="row">
+    <span class="label">Summarizer Model</span>
+    <select id="model" onchange="saveConfig()">
+      <option value="claude-haiku-4-5">Haiku</option>
+      <option value="claude-sonnet-4-6">Sonnet</option>
+      <option value="claude-opus-4-6">Opus</option>
+    </select>
+  </div>
+  <div class="row">
+    <span class="label">Raw Mode</span>
+    <div id="rawToggle" class="toggle" onclick="toggleRaw()"></div>
+  </div>
+  <div class="row">
+    <span class="label">tmux Target</span>
+    <input type="text" id="targetInput" style="width:120px" onchange="saveConfig()">
+  </div>
+</div>
+
+<div class="card">
+  <h2>Recent Logs</h2>
+  <div class="logs" id="logs">Loading...</div>
+</div>
+
+<div class="footer">LiteClaw Dashboard &middot; Port <span id="port">7777</span></div>
+
+<script>
+async function load() {
+  try {
+    const [cfg, st, lg] = await Promise.all([
+      fetch('/api/config').then(r=>r.json()),
+      fetch('/api/status').then(r=>r.json()),
+      fetch('/api/logs').then(r=>r.json()),
+    ]);
+    document.getElementById('model').value = cfg.summarizer_model;
+    document.getElementById('targetInput').value = cfg.tmux_target;
+    document.getElementById('port').textContent = cfg.dashboard_port;
+    const rawEl = document.getElementById('rawToggle');
+    if (cfg.raw_mode) rawEl.classList.add('on'); else rawEl.classList.remove('on');
+    const dot = st.busy ? '<span class="status-dot busy"></span>Working...' : '<span class="status-dot idle"></span>Idle';
+    document.getElementById('state').innerHTML = dot;
+    document.getElementById('target').textContent = st.target;
+    document.getElementById('api').textContent = st.api_available ? 'Connected' : 'Unavailable';
+    document.getElementById('logs').textContent = (lg.lines || []).join('\\n') || 'No logs';
+  } catch(e) { console.error(e); }
+}
+async function saveConfig() {
+  await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({
+      summarizer_model: document.getElementById('model').value,
+      tmux_target: document.getElementById('targetInput').value,
+    })
+  });
+  load();
+}
+async function toggleRaw() {
+  const el = document.getElementById('rawToggle');
+  const newVal = !el.classList.contains('on');
+  await fetch('/api/config', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ raw_mode: newVal })
+  });
+  load();
+}
+load();
+setInterval(load, 5000);
+</script>
+</body>
+</html>"""
 
 
 # =============================================================================
@@ -277,6 +507,46 @@ class LiteClaw:
         self._log_offset = 0
         self._summarizer_ready = False  # Tier 2 tmux agent is running
         self._api_available = None      # None=unknown, True/False after probe
+        self._last_activity = None
+        # Multi-agent registry: {name: {session, project, status}}
+        self._agents: dict[str, dict] = {}
+        self._agents_file = Path(__file__).parent / ".agents.json"
+        self._load_agents()
+
+    def _load_agents(self):
+        """Load agent registry from .agents.json."""
+        if self._agents_file.exists():
+            try:
+                data = _json.loads(self._agents_file.read_text())
+                self._agents = data
+                log.info(f"Loaded {len(self._agents)} agent(s) from {self._agents_file}")
+            except Exception as e:
+                log.warning(f"Failed to load agents file: {e}")
+                self._agents = {}
+        # Reconcile: check which agent sessions are still alive
+        for name, info in list(self._agents.items()):
+            r = subprocess.run(
+                ["tmux", "has-session", "-t", info["session"]],
+                capture_output=True,
+            )
+            if r.returncode != 0:
+                log.info(f"Agent '{name}' session '{info['session']}' no longer exists, marking dead")
+                info["status"] = "dead"
+
+    def _save_agents(self):
+        """Persist agent registry to .agents.json."""
+        try:
+            self._agents_file.write_text(_json.dumps(self._agents, indent=2))
+        except Exception as e:
+            log.warning(f"Failed to save agents file: {e}")
+
+    def _agent_session_alive(self, session: str) -> bool:
+        """Check if a tmux session is still running."""
+        r = subprocess.run(
+            ["tmux", "has-session", "-t", session],
+            capture_output=True,
+        )
+        return r.returncode == 0
 
     def _auth(self, update: Update) -> bool:
         """Check if message is from authorized chat."""
@@ -356,7 +626,13 @@ class LiteClaw:
             "/escape — send Escape key\n"
             "/raw — toggle raw/summarized output\n"
             "/model MODEL — change summarizer model\n"
-            "/get FILEPATH — download a file",
+            "/get FILEPATH — download a file\n\n"
+            "Multi-Agent:\n"
+            "/agents — list all agents\n"
+            "/agent new NAME PATH — create agent\n"
+            "/agent status — detailed agent status\n"
+            "/agent remove NAME — remove agent\n"
+            "/assign NAME task — assign task to agent",
             parse_mode="Markdown",
         )
 
@@ -441,6 +717,342 @@ class LiteClaw:
         text = r.stdout.strip() or "(no sessions)"
         await update.message.reply_text(f"```\n{text}\n```", parse_mode="Markdown")
 
+    # -- multi-agent commands --
+
+    async def cmd_agents(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """List all registered agents."""
+        if not self._auth(update):
+            return
+        if not self._agents:
+            await update.message.reply_text("No agents registered. Use /agent new <name> <path>")
+            return
+
+        lines = []
+        for name, info in self._agents.items():
+            alive = self._agent_session_alive(info["session"])
+            if alive:
+                # Check if agent is idle by looking for prompt
+                try:
+                    pane = capture_pane(info["session"], lines=15)
+                    status = "idle" if has_prompt(pane) else "busy"
+                except RuntimeError:
+                    status = "error"
+            else:
+                status = "dead"
+            info["status"] = status
+            icon = {"idle": "🟢", "busy": "🟡", "dead": "🔴", "error": "🔴"}.get(status, "⚪")
+            lines.append(f"{icon} {name} [{status}]\n   {info['project']}")
+
+        self._save_agents()
+        await update.message.reply_text("Agents:\n\n" + "\n\n".join(lines))
+
+    async def cmd_agent(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Handle /agent subcommands: new, status, remove."""
+        if not self._auth(update):
+            return
+        args = ctx.args
+        if not args:
+            await update.message.reply_text(
+                "Usage:\n"
+                "/agent new <name> <project_path>\n"
+                "/agent status\n"
+                "/agent remove <name>"
+            )
+            return
+
+        subcmd = args[0].lower()
+
+        if subcmd == "new":
+            if len(args) < 3:
+                await update.message.reply_text("Usage: /agent new <name> <project_path>")
+                return
+            name = args[1]
+            project_path = " ".join(args[2:])  # allow spaces in path
+
+            # Validate project path
+            if not Path(project_path).is_dir():
+                await update.message.reply_text(f"Error: directory not found: {project_path}")
+                return
+
+            if name in self._agents:
+                existing = self._agents[name]
+                if self._agent_session_alive(existing["session"]):
+                    await update.message.reply_text(
+                        f"Agent '{name}' already exists and is alive.\n"
+                        "Use /agent remove <name> first."
+                    )
+                    return
+
+            session_name = f"agent-{name}"
+
+            # Create tmux session
+            try:
+                subprocess.run(
+                    ["tmux", "new-session", "-d", "-s", session_name,
+                     "-x", "200", "-y", "50"],
+                    check=True, capture_output=True,
+                )
+                # cd to project path and start Claude Code
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name,
+                     f"cd {project_path} && claude --dangerously-skip-permissions", "Enter"],
+                    check=True,
+                )
+            except subprocess.CalledProcessError as e:
+                await update.message.reply_text(f"Error creating tmux session: {e}")
+                return
+
+            self._agents[name] = {
+                "session": session_name,
+                "project": project_path,
+                "status": "starting",
+            }
+            self._save_agents()
+
+            await update.message.reply_text(
+                f"Agent '{name}' created.\n"
+                f"Session: `{session_name}`\n"
+                f"Project: `{project_path}`\n"
+                "Waiting for Claude Code to start...",
+                parse_mode="Markdown",
+            )
+
+            # Wait for Claude Code prompt
+            for _ in range(20):  # max 20 seconds
+                await asyncio.sleep(1)
+                try:
+                    content = capture_pane(session_name, lines=10)
+                    if has_prompt(content):
+                        self._agents[name]["status"] = "idle"
+                        self._save_agents()
+                        await update.message.reply_text(f"Agent '{name}' is ready.")
+                        return
+                except RuntimeError:
+                    pass
+
+            self._agents[name]["status"] = "unknown"
+            self._save_agents()
+            await update.message.reply_text(
+                f"Agent '{name}' session created but Claude Code prompt not detected yet.\n"
+                "It may still be starting. Try /agents to check."
+            )
+
+        elif subcmd == "status":
+            if not self._agents:
+                await update.message.reply_text("No agents registered.")
+                return
+
+            lines = []
+            for name, info in self._agents.items():
+                alive = self._agent_session_alive(info["session"])
+                if alive:
+                    try:
+                        pane = capture_pane(info["session"], lines=15)
+                        status = "idle" if has_prompt(pane) else "busy"
+                        # Get last few lines as preview
+                        preview_lines = clean_output(pane).strip().split("\n")[-3:]
+                        preview = "\n".join(l for l in preview_lines if l.strip())
+                    except RuntimeError:
+                        status = "error"
+                        preview = "(capture failed)"
+                else:
+                    status = "dead"
+                    preview = "(session not found)"
+                info["status"] = status
+                icon = {"idle": "🟢", "busy": "🟡", "dead": "🔴", "error": "🔴"}.get(status, "⚪")
+                lines.append(
+                    f"{icon} {name} [{status}]\n"
+                    f"   Session: {info['session']}\n"
+                    f"   Project: {info['project']}\n"
+                    f"   Preview: {preview[:200]}"
+                )
+
+            self._save_agents()
+            await update.message.reply_text("Agent Status:\n\n" + "\n\n".join(lines))
+
+        elif subcmd == "remove":
+            if len(args) < 2:
+                await update.message.reply_text("Usage: /agent remove <name>")
+                return
+            name = args[1]
+            if name not in self._agents:
+                await update.message.reply_text(f"Agent '{name}' not found.")
+                return
+            info = self._agents[name]
+            # Kill tmux session if alive
+            if self._agent_session_alive(info["session"]):
+                subprocess.run(
+                    ["tmux", "kill-session", "-t", info["session"]],
+                    capture_output=True,
+                )
+            del self._agents[name]
+            self._save_agents()
+            await update.message.reply_text(f"Agent '{name}' removed.")
+
+        else:
+            await update.message.reply_text(
+                f"Unknown subcommand: {subcmd}\n"
+                "Usage: /agent new|status|remove"
+            )
+
+    async def cmd_assign(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Assign a task to an agent and poll for response."""
+        if not self._auth(update):
+            return
+        args = ctx.args
+        if not args or len(args) < 2:
+            await update.message.reply_text("Usage: /assign <agent_name> <task text>")
+            return
+
+        agent_name = args[0]
+        task_text = " ".join(args[1:])
+
+        if agent_name not in self._agents:
+            await update.message.reply_text(
+                f"Agent '{agent_name}' not found.\n"
+                f"Available: {', '.join(self._agents.keys()) or '(none)'}"
+            )
+            return
+
+        info = self._agents[agent_name]
+        session = info["session"]
+
+        if not self._agent_session_alive(session):
+            info["status"] = "dead"
+            self._save_agents()
+            await update.message.reply_text(
+                f"Agent '{agent_name}' session is dead. Use /agent remove and recreate."
+            )
+            return
+
+        # Check if agent is idle
+        try:
+            pane = capture_pane(session, lines=15)
+            if not has_prompt(pane):
+                preview = clean_output(pane).strip().split("\n")[-3:]
+                await update.message.reply_text(
+                    f"Agent '{agent_name}' is busy:\n```\n" +
+                    "\n".join(preview) + "\n```\nWait for it to finish.",
+                    parse_mode="Markdown",
+                )
+                return
+        except RuntimeError as e:
+            await update.message.reply_text(f"Error checking agent: {e}")
+            return
+
+        # Send task to agent
+        info["status"] = "busy"
+        self._save_agents()
+
+        try:
+            send_keys(session, task_text)
+            send_enter(session)
+
+            await update.message.reply_text(
+                f"📤 Task sent to agent '{agent_name}'.\nWaiting for response..."
+            )
+
+            # Poll for response (reuse same pattern as _poll_response but targeting agent session)
+            response = await self._poll_agent_response(ctx.bot, session, task_text)
+
+            if response.strip():
+                if not self.raw_mode:
+                    response = await self._summarize(task_text, response)
+                for chunk in split_message(response):
+                    await update.message.reply_text(chunk)
+            else:
+                await update.message.reply_text(f"Agent '{agent_name}': (empty response)")
+
+        except Exception as e:
+            log.exception(f"Error assigning task to agent '{agent_name}'")
+            await update.message.reply_text(f"Error: {e}")
+        finally:
+            info["status"] = "idle"
+            self._save_agents()
+
+    async def _poll_agent_response(self, bot, session: str, user_text: str) -> str:
+        """Poll an agent's tmux session until response stabilizes."""
+        prev_content = ""
+        stable_count = 0
+        elapsed = 0.0
+        last_typing = 0.0
+        last_status = 0.0
+        status_interval = INTERMEDIATE_INTERVAL
+        status_msg_id = None
+
+        await asyncio.sleep(2)
+        elapsed += 2
+
+        while MAX_WAIT == 0 or elapsed < MAX_WAIT:
+            # Typing indicator every 4s
+            if elapsed - last_typing >= 4:
+                try:
+                    await bot.send_chat_action(chat_id=CHAT_ID, action=ChatAction.TYPING)
+                except Exception:
+                    pass
+                last_typing = elapsed
+
+            # Prompt detection via capture-pane
+            pane_content = capture_pane(session, lines=15)
+            cleaned = pane_content.strip()
+
+            if cleaned == prev_content:
+                stable_count += 1
+            else:
+                stable_count = 0
+            prev_content = cleaned
+
+            # Status update at adaptive interval
+            if elapsed - last_status >= status_interval:
+                status_capture = capture_pane(session, lines=10)
+                preview_text = clean_output(status_capture).strip()
+                if preview_text:
+                    preview_lines = [l for l in preview_text.split("\n") if l.strip()][-5:]
+                    preview = "\n".join(preview_lines)
+                    status_text = f"⏳ Agent working... ({int(elapsed)}s)\n\n{preview[:1500]}"
+                    try:
+                        if status_msg_id:
+                            await bot.edit_message_text(
+                                chat_id=CHAT_ID,
+                                message_id=status_msg_id,
+                                text=status_text,
+                            )
+                        else:
+                            msg = await bot.send_message(
+                                chat_id=CHAT_ID, text=status_text,
+                            )
+                            status_msg_id = msg.message_id
+                    except Exception:
+                        pass
+                last_status = elapsed
+                status_interval = min(status_interval + 5, 60)
+
+            # Done: stable AND prompt visible
+            if stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content):
+                break
+
+            await asyncio.sleep(POLL_INTERVAL)
+            elapsed += POLL_INTERVAL
+        else:
+            log.warning(f"Agent poll timeout after {MAX_WAIT}s")
+
+        # Clean up status message
+        if status_msg_id:
+            try:
+                await bot.delete_message(chat_id=CHAT_ID, message_id=status_msg_id)
+            except Exception:
+                pass
+
+        # Extract response
+        full_capture = capture_pane(session, lines=SCROLLBACK_LINES)
+        text = self._extract_response(full_capture, user_text)
+
+        if MAX_WAIT > 0 and elapsed >= MAX_WAIT:
+            text += "\n\n⚠️ [TIMEOUT — agent may still be working]"
+
+        log.info(f"Agent response extracted: {len(text)} chars")
+        return text
+
     async def cmd_get(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Send a file from the server to Telegram."""
         if not self._auth(update):
@@ -516,6 +1128,7 @@ class LiteClaw:
             relay_msg += f"\n\nUser's message: {caption}"
 
         self.busy = True
+        self._last_activity = datetime.now().isoformat()
         try:
             if not self._pipe_active:
                 self._start_pipe()
@@ -566,6 +1179,7 @@ class LiteClaw:
             relay_msg += f"\nUser's message: {caption}"
 
         self.busy = True
+        self._last_activity = datetime.now().isoformat()
         try:
             if not self._pipe_active:
                 self._start_pipe()
@@ -609,6 +1223,7 @@ class LiteClaw:
             return
 
         self.busy = True
+        self._last_activity = datetime.now().isoformat()
         log.info(f"Received: {user_text[:80]}...")
 
         try:
@@ -819,6 +1434,62 @@ class LiteClaw:
         except Exception:
             return False
 
+    async def _recover_proxy(self) -> bool:
+        """Try to restart max-api-proxy Docker container."""
+        log.warning("Attempting to restart max-api-proxy...")
+        try:
+            r = subprocess.run(
+                ["docker", "compose", "up", "-d"],
+                cwd="/home/breaktheready/projects/max_api_proxy",
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                await asyncio.sleep(3)
+                if await self._probe_api():
+                    log.info("max-api-proxy recovered successfully")
+                    await self._notify_recovery("max-api-proxy restarted")
+                    return True
+        except Exception as e:
+            log.warning(f"Proxy recovery failed: {e}")
+        return False
+
+    def _check_session_401(self, session: str) -> bool:
+        """Check if a tmux session shows 401 auth error."""
+        try:
+            content = capture_pane(session, lines=10)
+            return "401" in content and ("authentication" in content.lower() or "Please run /login" in content)
+        except Exception:
+            return False
+
+    async def _recover_session_auth(self, session: str) -> bool:
+        """Send /login to a Claude Code session to re-authenticate."""
+        log.warning(f"Attempting to re-authenticate session: {session}")
+        try:
+            send_keys(session, "/login")
+            send_enter(session)
+            for _ in range(15):
+                await asyncio.sleep(2)
+                content = capture_pane(session, lines=10)
+                if has_prompt(content) and "401" not in content:
+                    log.info(f"Session {session} re-authenticated")
+                    await self._notify_recovery(f"Session {session} re-authenticated")
+                    return True
+            log.warning(f"Re-authentication timed out for {session}")
+        except Exception as e:
+            log.warning(f"Re-auth failed for {session}: {e}")
+        return False
+
+    async def _notify_recovery(self, message: str):
+        """Send recovery notification to Telegram."""
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": f"🔧 Auto-recovery: {message}"},
+                )
+        except Exception as e:
+            log.warning(f"Failed to send recovery notification: {e}")
+
     async def _ensure_summarizer_agent(self) -> bool:
         """Ensure the hidden Claude Code summarizer session exists."""
         if self._summarizer_ready:
@@ -828,6 +1499,10 @@ class LiteClaw:
                 capture_output=True,
             )
             if r.returncode == 0:
+                # Check for 401 auth error and attempt recovery
+                if self._check_session_401(SUMMARIZER_AGENT_SESSION):
+                    log.warning("Summarizer session has 401 error, attempting re-auth")
+                    await self._recover_session_auth(SUMMARIZER_AGENT_SESSION)
                 return True
             self._summarizer_ready = False
 
@@ -936,37 +1611,66 @@ class LiteClaw:
 
     async def _summarize(self, user_question: str, raw_output: str) -> str:
         """3-tier summarization: API proxy -> Claude agent -> raw."""
+        log.info(f"Summarizing: {len(raw_output)} chars, api_available={self._api_available}, raw_mode={self.raw_mode}")
         if len(raw_output.strip()) < 50:
+            log.info("Skipping summarize: too short")
             return raw_output
 
         # Tier 1: API proxy
-        if self._api_available is not False:
-            try:
-                async with httpx.AsyncClient(timeout=15) as client:
-                    resp = await client.post(
-                        f"{SUMMARIZER_URL}/chat/completions",
-                        headers={"Authorization": "Bearer not-needed"},
-                        json={
-                            "model": SUMMARIZER_MODEL,
-                            "messages": [
-                                {"role": "system", "content": SUMMARIZE_PROMPT},
-                                {"role": "user", "content": (
-                                    f"User's question:\n{user_question}\n\n"
-                                    f"Raw Claude Code output:\n```\n{raw_output[:6000]}\n```"
-                                )},
-                            ],
-                            "max_tokens": 2000,
-                        },
-                    )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    self._api_available = True
-                    return data["choices"][0]["message"]["content"]
-            except Exception as e:
-                log.info(f"Tier 1 (API) failed: {e}, trying Tier 2...")
-                self._api_available = False
+        tier1_payload = {
+            "model": SUMMARIZER_MODEL,
+            "messages": [
+                {"role": "system", "content": SUMMARIZE_PROMPT},
+                {"role": "user", "content": (
+                    f"User's question:\n{user_question}\n\n"
+                    f"Raw Claude Code output:\n```\n{raw_output[:12000]}\n```"
+                )},
+            ],
+            "max_tokens": 4000,
+        }
+        tier1_headers = {"Authorization": "Bearer not-needed"}
+        tier1_url = f"{SUMMARIZER_URL}/chat/completions"
+
+        _tier1_connection_error = False
+        try:
+            async with httpx.AsyncClient(timeout=60) as client:
+                resp = await client.post(tier1_url, headers=tier1_headers, json=tier1_payload)
+                resp.raise_for_status()
+                data = resp.json()
+                self._api_available = True
+                result = data["choices"][0]["message"]["content"]
+                log.info(f"Tier 1 (API) success: {len(result)} chars summarized")
+                return result
+        except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+            log.warning(f"Tier 1 (API) connection error: {e}, attempting proxy recovery...")
+            _tier1_connection_error = True
+        except Exception as e:
+            log.warning(f"Tier 1 (API) failed: {e}, trying Tier 2...")
+
+        # If connection error, try to restart the proxy and retry Tier 1 once
+        if _tier1_connection_error:
+            recovered = await self._recover_proxy()
+            if recovered:
+                try:
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        resp = await client.post(tier1_url, headers=tier1_headers, json=tier1_payload)
+                        resp.raise_for_status()
+                        data = resp.json()
+                        self._api_available = True
+                        result = data["choices"][0]["message"]["content"]
+                        log.info(f"Tier 1 (API) retry success: {len(result)} chars summarized")
+                        return result
+                except Exception as e:
+                    log.warning(f"Tier 1 (API) retry after recovery failed: {e}, trying Tier 2...")
+            else:
+                log.warning("Proxy recovery failed, trying Tier 2...")
 
         # Tier 2: Claude Code agent in hidden tmux
+        # Check for 401 before attempting to use the session
+        if self._check_session_401(SUMMARIZER_AGENT_SESSION):
+            log.warning("Summarizer session shows 401 before Tier 2, attempting re-auth")
+            await self._recover_session_auth(SUMMARIZER_AGENT_SESSION)
+
         result = await self._summarize_via_agent(user_question, raw_output)
         if result:
             return result
@@ -1006,6 +1710,9 @@ class LiteClaw:
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         app.add_handler(CommandHandler("get", self.cmd_get))
+        app.add_handler(CommandHandler("agents", self.cmd_agents))
+        app.add_handler(CommandHandler("agent", self.cmd_agent))
+        app.add_handler(CommandHandler("assign", self.cmd_assign))
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))
@@ -1024,6 +1731,14 @@ class LiteClaw:
             log.info("Summarizer: API proxy not available, will use Claude Code agent (Tier 2)")
             loop.run_until_complete(self._ensure_summarizer_agent())
             loop.close()
+
+        # Start dashboard in background thread
+        if DASHBOARD_PORT:
+            handler = partial(DashboardHandler, self)
+            server = HTTPServer(("0.0.0.0", DASHBOARD_PORT), handler)
+            dash_thread = threading.Thread(target=server.serve_forever, daemon=True)
+            dash_thread.start()
+            log.info(f"Dashboard started at http://localhost:{DASHBOARD_PORT}")
 
         log.info(f"Bridge started. Target: {self.target}")
         log.info("Send a message to your Telegram bot to begin.")

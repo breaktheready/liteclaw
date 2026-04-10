@@ -36,6 +36,9 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
 - **File transfer** — Send files to the server and download results back to Telegram
 - **Multi-target** — Switch between tmux sessions and windows on the fly
 - **Photo upload** — Send photos for Claude's vision tasks
+- **Multi-agent orchestration** — LiteClaw acts as org lead, spinning up independent peer agents in separate tmux sessions. New commands: `/agents`, `/agent new|status|remove`, `/assign`. Agent registry persists across restarts.
+- **Auto-recovery** — Detects and recovers from API proxy downtime automatically. Re-authenticates Claude Code sessions on 401 errors and notifies you via Telegram when back online.
+- **Unified notifications** — All Telegram messages route through a single `notify.py` module with summarizer cleanup. Falls back to raw output if the summarizer is unavailable.
 
 ---
 
@@ -247,6 +250,34 @@ At startup, LiteClaw probes the API endpoint. If it's unreachable, Tier 2 is pre
 **`--dangerously-skip-permissions`** — This flag disables Claude Code's permission prompts, auto-approving all file writes, shell commands, and other actions. Only use this in trusted environments where you understand the implications.
 
 **Network** — LiteClaw connects only to the Telegram API (for receiving and sending messages) and optionally to your local summarizer endpoint. No user data is sent to external servers beyond Telegram's own infrastructure.
+
+---
+
+## Dashboard
+
+LiteClaw includes a built-in web dashboard for managing settings.
+
+### Access
+
+After starting LiteClaw, open: `http://localhost:7777`
+
+### Features
+
+- **Status**: See if Claude is busy or idle, API proxy availability
+- **Model**: Switch summarizer model (Haiku/Sonnet/Opus) from dropdown
+- **Raw Mode**: Toggle on/off with one click
+- **Target**: Change tmux target without Telegram commands
+- **Logs**: View recent activity
+
+### Configuration
+
+Set the port in `.env`:
+
+```env
+DASHBOARD_PORT=7777
+```
+
+Set to `0` to disable the dashboard.
 
 ---
 

@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.4.2 (2026-04-12) — Response Delivery Overhaul
+
+### Fixed
+- Premature response capture during Claude tool calls (prompt_count tuning)
+- `tmux send-keys` crash on special characters (quotes, newlines, Unicode)
+- Incorrect response extraction when user echo not found in scrollback
+- Previous follow-up task overwriting current message on new input
+- Infinite follow-up loop when pane content continuously changes
+
+### Added
+- **Follow-up edit**: Delivered messages auto-update as Claude continues working
+  - Continuous monitoring loop (5 min max)
+  - Late edit notification (once, after 60s)
+  - Previous follow-up cancelled on new message
+- **Conversation history**: All exchanges logged to `~/.liteclaw-history.jsonl`
+- **`/recall` command**: Search/summarize past conversations with keyword filter
+- **Pre-snapshot diff**: Reliable response extraction by comparing pane before/after
+- **Status message cleanup**: "Sent. Waiting..." deleted before final delivery
+
+### Removed
+- `_pane_watcher` background task (replaced by follow-up edit)
+- `_checkback_deliver` and `_judge_new_content` (obsolete)
+
+### Changed
+- `send_keys()`: Now uses `tmux load-buffer` + `paste-buffer` for safety
+- `MAX_WAIT`: Set to 45s (was infinite)
+- Completion detection: `prompt_count >= 5` with last-3-line stability comparison
+
+## v0.4.1 (2026-04-11)
+
+### Fixed
+- **Premature completion detection during tool calls**: `_poll_response()` no longer detects "done" when Claude Code is mid-tool-call
+  - Added `is_idle_prompt()` — checks prompt visibility AND absence of activity spinners simultaneously
+  - Expanded `_ACTIVITY_PATTERNS` to cover all 22 known Claude Code spinner labels (Doing, Computing, Channelling, Nesting, Brewing, etc.) plus `(thinking)` indicator
+  - Changed completion criteria from `prompt_count >= 3` to `prompt_count >= 5` (~7.5s of continuous idle required)
+  - Added `elapsed >= 5` minimum wait to prevent premature exit
+- **Missed response delivery**: When liteclaw sent an incomplete response (due to premature completion), the actual final response was never delivered
+  - Added `_checkback_deliver()` — 30s after delivery, re-checks pane for new content; sends follow-up message if genuinely new output found (>10% longer)
+  - Comparison is raw-to-raw (pre-summarization) to avoid length mismatch false positives
+- **`_background_deliver()` now uses `is_idle_prompt()`** instead of `has_prompt()` for consistent idle detection
+- **Summarizer agent poll** also updated to use `is_idle_prompt()` for consistency
+- **Cleaned up 145 stale OMC todo files** that were triggering Stop hook and blocking Claude Code responses
+
 ## v0.4.0 (2026-04-10)
 
 ### Added

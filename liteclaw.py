@@ -55,13 +55,13 @@ TMUX_TARGET = os.environ.get("TMUX_TARGET", "claude:1")
 
 # Summarizer config (local Claude proxy)
 SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://localhost:8080/v1")
-SUMMARIZER_MODEL = os.environ.get("SUMMARIZER_MODEL", "claude-haiku-4-5")
+SUMMARIZER_MODEL = os.environ.get("SUMMARIZER_MODEL", "claude-sonnet-4-6")
 SUMMARIZER_AGENT_MODEL = os.environ.get("SUMMARIZER_AGENT_MODEL", "")  # model for Tier 2 agent
 SUMMARIZER_AGENT_SESSION = "liteclaw-summarizer"  # hidden tmux session for Tier 2
 
 POLL_INTERVAL = 1.5      # seconds between capture-pane polls
 STABILITY_THRESHOLD = 3   # consecutive unchanged polls = response done
-MAX_WAIT = 0              # 0 = no timeout (wait indefinitely)
+MAX_WAIT = 45             # seconds — force deliver to prevent infinite wait
 SCROLLBACK_LINES = int(os.environ.get("SCROLLBACK_LINES", "500"))
 TG_MAX_LEN = 4000         # telegram message length (leave buffer from 4096)
 
@@ -77,6 +77,10 @@ INTERMEDIATE_MIN_CHARS = 200  # minimum new chars to trigger intermediate update
 
 # File transfer config
 STAGING_DIR = Path(os.environ.get("STAGING_DIR", os.path.expanduser("~/liteclaw-files")))
+
+# Conversation history
+HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", os.path.expanduser("~/.liteclaw-history.jsonl")))
+HISTORY_RECALL_LIMIT = int(os.environ.get("HISTORY_RECALL_LIMIT", "50"))  # max entries for /recall
 
 # =============================================================================
 # Logging
@@ -166,23 +170,32 @@ def capture_pane(target: str, lines: int = SCROLLBACK_LINES) -> str:
 
 
 def send_keys(target: str, text: str, literal: bool = True):
-    """Send keystrokes to tmux pane. Long text (>500 chars) is saved to a temp
-    file and the path is sent instead, to avoid tmux bracketed paste issues."""
+    """Send text to tmux pane via load-buffer + paste-buffer for safety.
+    Handles special characters, quotes, newlines without crashing.
+    Long text (>500 chars) is saved to a file and the path is sent instead."""
     if literal and len(text) > 500:
-        # Long text breaks tmux send-keys (shows as "[Pasted text +N lines]")
-        # Save to file and tell Claude to read it
+        # Long text: save to file and tell Claude to read it
         tmp = f"/tmp/liteclaw_input_{int(datetime.now().timestamp())}.txt"
         Path(tmp).write_text(text, encoding="utf-8")
-        msg = f"Read this file and follow the instructions inside: {tmp}"
-        cmd = ["tmux", "send-keys", "-t", target, "-l", msg]
-        subprocess.run(cmd, check=True)
-        log.info(f"Long input ({len(text)} chars) saved to {tmp}")
+        text = f"Read this file and follow the instructions inside: {tmp}"
+        log.info(f"Long input saved to {tmp}")
+
+    if not literal:
+        # Non-literal: direct send-keys (for control sequences)
+        subprocess.run(["tmux", "send-keys", "-t", target, text], check=True)
         return
-    cmd = ["tmux", "send-keys", "-t", target]
-    if literal:
-        cmd.append("-l")
-    cmd.append(text)
-    subprocess.run(cmd, check=True)
+
+    # Use load-buffer + paste-buffer to avoid send-keys special char issues
+    tmp_buf = f"/tmp/liteclaw_buf_{os.getpid()}.txt"
+    try:
+        Path(tmp_buf).write_text(text, encoding="utf-8")
+        subprocess.run(["tmux", "load-buffer", tmp_buf], check=True)
+        subprocess.run(["tmux", "paste-buffer", "-t", target], check=True)
+    finally:
+        try:
+            os.unlink(tmp_buf)
+        except OSError:
+            pass
 
 
 def send_enter(target: str):
@@ -199,6 +212,39 @@ def has_prompt(content: str) -> bool:
         if _PROMPT_RE.search(normalized):
             return True
     return False
+
+
+def is_idle_prompt(content: str) -> bool:
+    """Check if Claude Code is truly idle — prompt visible AND no activity indicators.
+    More reliable than has_prompt() alone, which can trigger during tool call pauses."""
+    lines = content.strip().split("\n")
+    if not lines:
+        return False
+    # Check last 5 non-empty lines for activity indicators
+    last_lines = [l for l in lines[-10:] if l.strip()]
+    if not last_lines:
+        return False
+    # Must have prompt
+    if not has_prompt(content):
+        return False
+    # Must NOT have any activity spinner in recent lines
+    for line in last_lines[-5:]:
+        if _ACTIVITY_PATTERNS.search(line):
+            return False
+    return True
+
+
+# Patterns that indicate Claude Code is still working (tool calls in progress)
+# Covers all 19 known Claude Code CLI activity labels
+_ACTIVITY_LABELS = (
+    "Doing|Reading|Running|Writing|Searching|Editing|Thinking|Calling|Executing"
+    "|Computing|Channelling|Nesting|Brewing|Recalling|Initializing"
+    "|Misting|Expanding|Parsing|Crafting|Focusing|Wondering|Pondering"
+)
+_ACTIVITY_PATTERNS = re.compile(
+    rf"[✻✶✽✢·●*◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*(?:{_ACTIVITY_LABELS})"
+    r"|\(thinking\)"
+)
 
 
 def get_pane_cwd(target: str) -> str:
@@ -510,6 +556,7 @@ class LiteClaw:
         self._summarizer_ready = False  # Tier 2 tmux agent is running
         self._api_available = None      # None=unknown, True/False after probe
         self._last_activity = None
+        self._followup_task: asyncio.Task | None = None  # track active follow-up
         # Multi-agent registry: {name: {session, project, status}}
         self._agents: dict[str, dict] = {}
         self._agents_file = Path(__file__).parent / ".agents.json"
@@ -594,6 +641,20 @@ class LiteClaw:
         else:
             self._log_offset = 0
 
+    def _log_conversation(self, user_text: str, response: str, summarized: bool = False):
+        """Append a conversation turn to JSONL history file."""
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "user": user_text[:500],  # cap to avoid bloat
+            "response": response[:2000],  # keep summarized version (compact)
+            "summarized": summarized,
+        }
+        try:
+            with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+                f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        except OSError as e:
+            log.warning(f"Failed to write history: {e}")
+
     def _read_new_output(self) -> str:
         """Read new output from pipe log since last recorded offset."""
         if not self._log_path or not os.path.exists(self._log_path):
@@ -628,7 +689,8 @@ class LiteClaw:
             "/escape — send Escape key\n"
             "/raw — toggle raw/summarized output\n"
             "/model MODEL — change summarizer model\n"
-            "/get FILEPATH — download a file\n\n"
+            "/get FILEPATH — download a file\n"
+            "/recall [N|keyword] — recall conversation history\n\n"
             "Multi-Agent:\n"
             "/agents — list all agents\n"
             "/agent new NAME PATH — create agent\n"
@@ -1005,8 +1067,8 @@ class LiteClaw:
                 stable_count = 0
             prev_content = cleaned
 
-            # Track consecutive prompt detections
-            if has_prompt(pane_content):
+            # Track consecutive idle prompt detections
+            if is_idle_prompt(pane_content):
                 prompt_count += 1
             else:
                 prompt_count = 0
@@ -1036,8 +1098,8 @@ class LiteClaw:
                 last_status = elapsed
                 status_interval = min(status_interval + 5, 60)
 
-            # Done: (stable AND prompt visible) OR prompt visible for 3+ consecutive polls
-            if (stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content)) or prompt_count >= 3:
+            # Done: idle prompt detected for 5+ consecutive polls
+            if elapsed >= 5 and prompt_count >= 5:
                 log.info(f"Agent poll complete after {elapsed:.1f}s (stable_count={stable_count}, prompt_count={prompt_count})")
                 break
 
@@ -1099,6 +1161,109 @@ class LiteClaw:
                 )
         except Exception as e:
             await update.message.reply_text(f"Error sending file: {e}")
+
+    async def cmd_recall(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Recall recent conversation history, optionally filtered by keyword.
+
+        Usage:
+            /recall          — summarize last 20 conversations
+            /recall 50       — summarize last 50 conversations
+            /recall keyword  — search + summarize matching conversations
+        """
+        if not self._auth(update):
+            return
+
+        if not HISTORY_FILE.exists():
+            await update.message.reply_text("No conversation history yet.")
+            return
+
+        # Parse args: number or keyword
+        args = ctx.args
+        limit = HISTORY_RECALL_LIMIT
+        keyword = None
+        if args:
+            if args[0].isdigit():
+                limit = min(int(args[0]), 200)
+            else:
+                keyword = " ".join(args).lower()
+
+        # Read history (tail for efficiency)
+        try:
+            lines = HISTORY_FILE.read_text(encoding="utf-8").strip().split("\n")
+        except OSError as e:
+            await update.message.reply_text(f"Error reading history: {e}")
+            return
+
+        entries = []
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                entries.append(_json.loads(line))
+            except _json.JSONDecodeError:
+                continue
+
+        if keyword:
+            entries = [
+                e for e in entries
+                if keyword in e.get("user", "").lower()
+                or keyword in e.get("response", "").lower()
+            ]
+
+        entries = entries[-limit:]
+
+        if not entries:
+            await update.message.reply_text("No matching conversations found.")
+            return
+
+        # Build context for summarizer
+        conv_text = []
+        for e in entries:
+            ts = e.get("ts", "?")[:16]  # YYYY-MM-DDTHH:MM
+            user = e.get("user", "")[:200]
+            resp = e.get("response", "")[:300]
+            conv_text.append(f"[{ts}] User: {user}\nClaude: {resp}")
+
+        context_block = "\n---\n".join(conv_text)
+
+        # Summarize with Haiku
+        await update.message.reply_text(f"Recalling {len(entries)} conversations...")
+        try:
+            await ctx.bot.send_chat_action(chat_id=CHAT_ID, action=ChatAction.TYPING)
+        except Exception:
+            pass
+
+        recall_prompt = (
+            "You are reviewing a conversation history between a user and Claude Code (via Telegram bridge). "
+            "Provide a concise summary of the key topics, decisions, and outcomes. "
+            "Group by topic if possible. Use bullet points. Keep it under 2000 chars. "
+            "If a keyword filter was used, focus on those conversations.\n\n"
+            f"{'Keyword filter: ' + keyword + chr(10) if keyword else ''}"
+            f"Conversations ({len(entries)} entries):\n{context_block[:8000]}"
+        )
+
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                resp = await client.post(
+                    f"{SUMMARIZER_URL}/chat/completions",
+                    headers={"Authorization": "Bearer not-needed"},
+                    json={
+                        "model": SUMMARIZER_MODEL,
+                        "messages": [{"role": "user", "content": recall_prompt}],
+                        "max_tokens": 2000,
+                    },
+                )
+                resp.raise_for_status()
+                summary = resp.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            # Fallback: just show raw recent entries
+            log.warning(f"Recall summarizer failed: {e}")
+            summary = "Summarizer unavailable. Recent entries:\n\n"
+            for e_item in entries[-10:]:
+                summary += f"[{e_item.get('ts', '?')[:16]}] {e_item.get('user', '')[:100]}\n"
+
+        for chunk in split_message(summary):
+            await update.message.reply_text(chunk)
 
     # -- file receive handlers --
 
@@ -1236,6 +1401,11 @@ class LiteClaw:
         self._last_activity = datetime.now().isoformat()
         log.info(f"Received: {user_text[:80]}...")
 
+        # Cancel any running follow-up from previous message
+        if self._followup_task and not self._followup_task.done():
+            self._followup_task.cancel()
+            log.info("Cancelled previous follow-up task")
+
         try:
             # Ensure pipe-pane is active
             if not self._pipe_active:
@@ -1245,10 +1415,11 @@ class LiteClaw:
             pane_snapshot = capture_pane(self.target, lines=15)
             claude_idle = has_prompt(pane_snapshot)
 
+            busy_msg = None
             if not claude_idle:
                 status_lines = clean_output(pane_snapshot).strip().split("\n")[-5:]
                 status_preview = "\n".join(l for l in status_lines if l.strip())
-                await update.message.reply_text(
+                busy_msg = await update.message.reply_text(
                     f"⚠️ Claude is currently busy:\n```\n{status_preview}\n```\n\n"
                     "Message queued — will notify when done.",
                     parse_mode="Markdown",
@@ -1257,18 +1428,36 @@ class LiteClaw:
             # Record offset before sending
             self._record_offset()
 
+            # Snapshot pane BEFORE sending for reliable diff extraction
+            pre_snapshot = capture_pane(self.target, lines=SCROLLBACK_LINES)
+
             # Send to tmux (Claude Code queues input even when busy)
             send_keys(self.target, user_text)
             send_enter(self.target)
 
+            sent_msg = None
             if claude_idle:
-                await update.message.reply_text("📤 Sent. Waiting for response...")
+                sent_msg = await update.message.reply_text("📤 Sent. Waiting for response...")
 
             # Poll for response with streaming feedback
-            response = await self._poll_response(ctx.bot, user_text)
+            response = await self._poll_response(ctx.bot, user_text, pre_snapshot=pre_snapshot)
+
+            # Delete status messages before delivering final response
+            for msg in (sent_msg, busy_msg):
+                if msg:
+                    try:
+                        await ctx.bot.delete_message(chat_id=CHAT_ID, message_id=msg.message_id)
+                    except Exception:
+                        pass
 
             # Deliver response (with persistent retry)
-            await self._deliver_response(response, user_text, update, ctx)
+            delivered_msg_id = await self._deliver_response(response, user_text, update, ctx)
+
+            # Schedule follow-up check: if Claude produces more output, edit the message
+            if delivered_msg_id:
+                self._followup_task = asyncio.create_task(
+                    self._followup_edit(user_text, pre_snapshot, delivered_msg_id, ctx.bot)
+                )
 
         except RuntimeError as e:
             await update.message.reply_text(f"Error: {e}")
@@ -1293,11 +1482,11 @@ class LiteClaw:
         finally:
             self.busy = False
 
-    async def _deliver_response(self, response: str, user_text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        """Deliver response to Telegram with retry. Summarizes unless raw mode."""
+    async def _deliver_response(self, response: str, user_text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int | None:
+        """Deliver response to Telegram with retry. Summarizes unless raw mode. Returns last message_id."""
         if not response.strip():
             await update.message.reply_text("(empty response)")
-            return
+            return None
 
         if not self.raw_mode:
             try:
@@ -1317,11 +1506,13 @@ class LiteClaw:
 
         chunks = split_message(response)
         log.info(f"Delivering response: {len(response)} chars in {len(chunks)} chunk(s)")
+        last_msg_id = None
         for i, chunk in enumerate(chunks):
             header = f"[{i+1}/{len(chunks)}]\n" if len(chunks) > 1 else ""
             for attempt in range(3):
                 try:
-                    await update.message.reply_text(f"{header}{chunk}")
+                    sent = await update.message.reply_text(f"{header}{chunk}")
+                    last_msg_id = sent.message_id
                     log.info(f"Delivery success: chunk {i+1}/{len(chunks)} ({len(chunk)} chars)")
                     break
                 except Exception as e:
@@ -1343,6 +1534,171 @@ class LiteClaw:
             if i < len(chunks) - 1:
                 await asyncio.sleep(0.5)
 
+        # Log conversation to history
+        self._log_conversation(user_text, response, summarized=not self.raw_mode)
+        return last_msg_id
+
+    async def _followup_edit(self, user_text: str, pre_snapshot: str, msg_id: int, bot):
+        """Continuously monitor pane and edit delivered message until Claude truly finishes.
+        Keeps updating even after apparent completion — re-checks to catch resumed work."""
+        await asyncio.sleep(15)
+        last_delivered = ""  # track what we last sent to avoid "not modified" errors
+        rounds_unchanged = 0  # consecutive rounds where extracted content didn't change
+        elapsed = 0
+        max_followup = 300  # 5 minutes max follow-up time
+        notified_late_edit = False  # only notify once about late updates
+
+        while rounds_unchanged < 3 and elapsed < max_followup:
+            # Wait for idle
+            prompt_count = 0
+            while True:
+                try:
+                    pane = capture_pane(self.target, lines=15)
+                    if is_idle_prompt(pane):
+                        prompt_count += 1
+                    else:
+                        prompt_count = 0
+                        rounds_unchanged = 0  # Claude resumed — reset
+
+                    if prompt_count >= 5:
+                        break
+
+                    elapsed += 5
+
+                    # Status edit every 30s while waiting
+                    if elapsed % 30 == 0:
+                        status_text = clean_output(pane).strip()
+                        preview = "\n".join(
+                            [l for l in status_text.split("\n") if l.strip()][-3:]
+                        )
+                        if preview:
+                            try:
+                                await bot.edit_message_text(
+                                    chat_id=CHAT_ID,
+                                    message_id=msg_id,
+                                    text=f"⏳ Working... ({elapsed + 15}s)\n\n{preview[:3500]}",
+                                )
+                            except Exception:
+                                pass
+
+                    await asyncio.sleep(5)
+                except Exception as e:
+                    log.warning(f"Follow-up wait error: {e}")
+                    await asyncio.sleep(5)
+                    elapsed += 5
+
+            # Idle detected — extract and update
+            try:
+                full = capture_pane(self.target, lines=SCROLLBACK_LINES)
+                new_response = self._extract_response(full, user_text, pre_snapshot)
+                if not new_response.strip():
+                    rounds_unchanged += 1
+                    await asyncio.sleep(30)
+                    elapsed += 30
+                    continue
+
+                if not self.raw_mode:
+                    try:
+                        new_response = await asyncio.wait_for(
+                            self._summarize(user_text, new_response),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+
+                # Check if content actually changed
+                if new_response.strip() == last_delivered.strip():
+                    rounds_unchanged += 1
+                    log.info(f"Follow-up: content unchanged (round {rounds_unchanged}/3)")
+                    await asyncio.sleep(30)
+                    elapsed += 30
+                    continue
+
+                # Content changed — update message
+                rounds_unchanged = 0
+                last_delivered = new_response
+                chunks = split_message(new_response)
+                if len(chunks) == 1:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=CHAT_ID,
+                            message_id=msg_id,
+                            text=chunks[0],
+                        )
+                        log.info(f"Follow-up edit: updated msg {msg_id} ({len(chunks[0])} chars)")
+                    except Exception as e:
+                        if "not modified" not in str(e).lower():
+                            log.warning(f"Follow-up edit failed: {e}")
+                else:
+                    try:
+                        await bot.delete_message(chat_id=CHAT_ID, message_id=msg_id)
+                    except Exception:
+                        pass
+                    for chunk in chunks:
+                        try:
+                            sent = await bot.send_message(chat_id=CHAT_ID, text=chunk)
+                            msg_id = sent.message_id
+                        except Exception:
+                            pass
+                    log.info(f"Follow-up: replaced with {len(chunks)} new message(s)")
+
+                # Notify user once if edit happened after 60s (they may have scrolled away)
+                if elapsed >= 60 and not notified_late_edit:
+                    notified_late_edit = True
+                    try:
+                        await bot.send_message(
+                            chat_id=CHAT_ID,
+                            text="📝 이전 응답이 업데이트되었습니다.",
+                        )
+                    except Exception:
+                        pass
+
+                self._log_conversation(user_text, new_response, summarized=not self.raw_mode)
+
+            except Exception as e:
+                log.warning(f"Follow-up edit error: {e}")
+
+            await asyncio.sleep(30)
+            elapsed += 30
+
+        # Final update: capture one last time and deliver definitive response
+        try:
+            full = capture_pane(self.target, lines=SCROLLBACK_LINES)
+            final_response = self._extract_response(full, user_text, pre_snapshot)
+            if final_response.strip() and final_response.strip() != last_delivered.strip():
+                if not self.raw_mode:
+                    try:
+                        final_response = await asyncio.wait_for(
+                            self._summarize(user_text, final_response),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
+                chunks = split_message(final_response)
+                if len(chunks) == 1:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=CHAT_ID, message_id=msg_id, text=chunks[0],
+                        )
+                        log.info(f"Follow-up: final edit to msg {msg_id} ({len(chunks[0])} chars)")
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        await bot.delete_message(chat_id=CHAT_ID, message_id=msg_id)
+                    except Exception:
+                        pass
+                    for chunk in chunks:
+                        try:
+                            await bot.send_message(chat_id=CHAT_ID, text=chunk)
+                        except Exception:
+                            pass
+                self._log_conversation(user_text, final_response, summarized=not self.raw_mode)
+        except Exception as e:
+            log.warning(f"Follow-up final update error: {e}")
+
+        log.info(f"Follow-up: finalized after {elapsed + 15}s total")
+
     async def _background_deliver(self, user_text: str, bot):
         """Background task: wait for Claude to finish, then deliver response."""
         log.info("Background delivery started — waiting for Claude to finish")
@@ -1353,14 +1709,14 @@ class LiteClaw:
             elapsed += 5
             try:
                 pane = capture_pane(self.target, lines=15)
-                if has_prompt(pane):
+                if is_idle_prompt(pane):
                     prompt_count += 1
                 else:
                     prompt_count = 0
                     continue
 
-                # Need 2+ consecutive prompt detections (10s) to confirm done
-                if prompt_count < 2:
+                # Need 3+ consecutive prompt detections (15s) to confirm done
+                if prompt_count < 3:
                     continue
 
                 full = capture_pane(self.target, lines=SCROLLBACK_LINES)
@@ -1395,7 +1751,7 @@ class LiteClaw:
         log.warning("Background delivery timeout (30min)")
         self.busy = False
 
-    async def _poll_response(self, bot, user_text: str = "") -> str:
+    async def _poll_response(self, bot, user_text: str = "", pre_snapshot: str = "") -> str:
         """Poll until response stabilizes. Uses pipe-pane log for output, capture-pane for prompt detection."""
         prev_content = ""
         stable_count = 0
@@ -1420,17 +1776,19 @@ class LiteClaw:
 
             # Prompt detection via capture-pane (small window, fast)
             pane_content = capture_pane(self.target, lines=15)
-            # Compare cleaned content (strips OMC status bar and other noise that changes every second)
-            cleaned = clean_output(pane_content).strip()
 
-            if cleaned == prev_content:
+            # Stability check: compare only last 3 lines (prompt area)
+            # Full pane changes during typing but prompt area stabilizes when done
+            cleaned_tail = "\n".join(clean_output(pane_content).strip().split("\n")[-3:])
+            if cleaned_tail == prev_content:
                 stable_count += 1
             else:
                 stable_count = 0
-            prev_content = cleaned
+            prev_content = cleaned_tail
 
-            # Track consecutive prompt detections (belt-and-suspenders)
-            if has_prompt(pane_content):
+            # Track consecutive idle prompt detections
+            # is_idle_prompt checks both prompt presence AND absence of activity
+            if is_idle_prompt(pane_content):
                 prompt_count += 1
             else:
                 prompt_count = 0
@@ -1460,8 +1818,8 @@ class LiteClaw:
                 last_status = elapsed
                 status_interval = min(status_interval + 5, 60)
 
-            # Done: (stable AND prompt visible) OR prompt visible for 3+ consecutive polls
-            if (stable_count >= STABILITY_THRESHOLD and has_prompt(pane_content)) or prompt_count >= 3:
+            # Done: idle prompt confirmed (~7.5s continuous idle)
+            if elapsed >= 5 and prompt_count >= 5:
                 log.info(f"Poll complete after {elapsed:.1f}s (stable_count={stable_count}, prompt_count={prompt_count})")
                 break
 
@@ -1479,7 +1837,7 @@ class LiteClaw:
 
         # Extract response using capture-pane (rendered output, not raw pipe)
         full_capture = capture_pane(self.target, lines=SCROLLBACK_LINES)
-        text = self._extract_response(full_capture, user_text)
+        text = self._extract_response(full_capture, user_text, pre_snapshot)
 
         if MAX_WAIT > 0 and elapsed >= MAX_WAIT:
             text += "\n\n⚠️ [TIMEOUT — Claude may still be working]"
@@ -1487,29 +1845,56 @@ class LiteClaw:
         log.info(f"Response extracted: {len(text)} chars")
         return text
 
-    def _extract_response(self, capture: str, user_text: str) -> str:
-        """Extract Claude's response from capture-pane by finding user echo."""
+    def _extract_response(self, capture: str, user_text: str, pre_snapshot: str = "") -> str:
+        """Extract Claude's response from capture-pane.
+        Primary: diff against pre_snapshot (reliable).
+        Fallback: echo matching (legacy)."""
         cleaned = clean_output(capture)
         lines = cleaned.split("\n")
 
+        # === Strategy 0: Diff against pre-snapshot (most reliable) ===
+        if pre_snapshot:
+            pre_cleaned = clean_output(pre_snapshot).strip()
+            pre_lines = pre_cleaned.split("\n")
+            # Find where pre-snapshot ends in current capture
+            # Match last 3 non-empty lines from pre-snapshot
+            anchor_lines = [l for l in pre_lines if l.strip()][-3:]
+            if anchor_lines:
+                for i in range(len(lines) - len(anchor_lines), -1, -1):
+                    if lines[i:i+len(anchor_lines)] == anchor_lines:
+                        response_lines = lines[i+len(anchor_lines):]
+                        # Skip the echoed user input (first non-empty line after anchor)
+                        while response_lines and not response_lines[0].strip():
+                            response_lines.pop(0)
+                        if response_lines:
+                            response_lines.pop(0)  # skip user echo line
+                        # Clean trailing prompt
+                        while response_lines and response_lines[-1].strip().strip("\xa0") in ("❯", ""):
+                            response_lines.pop()
+                        while response_lines and not response_lines[0].strip():
+                            response_lines.pop(0)
+                        result = "\n".join(response_lines).strip()
+                        if result:
+                            log.info(f"Response extracted via pre-snapshot diff: {len(result)} chars")
+                            return result
+
+        # === Strategy 1-3: Echo matching (fallback) ===
         search_text = user_text[:50].strip()
         user_echo_idx = -1
 
         if search_text:
-            # Strategy 1: Find line with ❯ prompt + user text (the actual echo line)
+            # Find line with ❯ prompt + user text
             for i in range(len(lines) - 1, -1, -1):
                 if "❯" in lines[i] and search_text in lines[i]:
                     user_echo_idx = i
                     break
-
-            # Strategy 2: Find user text on a line immediately after a ❯ line
+            # Find user text after a ❯ line
             if user_echo_idx < 0:
                 for i in range(len(lines) - 1, 0, -1):
                     if search_text in lines[i] and "❯" in lines[i - 1]:
                         user_echo_idx = i
                         break
-
-            # Strategy 3: Find user text anywhere (original approach, last resort)
+            # Find user text anywhere
             if user_echo_idx < 0:
                 for i in range(len(lines) - 1, -1, -1):
                     if search_text in lines[i]:
@@ -1519,26 +1904,20 @@ class LiteClaw:
         if user_echo_idx >= 0:
             response_lines = lines[user_echo_idx + 1:]
         else:
-            # Fallback: user echo scrolled off. Find the last ❯ prompt pair
-            # and take content between the second-to-last ❯ and the final ❯
             log.warning("Could not find user echo in capture-pane, using prompt-pair fallback")
             prompt_indices = [i for i, l in enumerate(lines) if "❯" in l.strip()]
             if len(prompt_indices) >= 2:
-                # Take content between second-to-last and last prompt
                 start = prompt_indices[-2] + 1
                 end = prompt_indices[-1]
                 response_lines = lines[start:end]
             elif prompt_indices:
-                # Only one prompt (the trailing one) — take everything before it
                 response_lines = lines[:prompt_indices[-1]]
             else:
                 response_lines = lines
 
-        # Remove trailing prompt (❯) and empty lines
+        # Clean trailing prompt and empty lines
         while response_lines and response_lines[-1].strip().strip("\xa0") in ("❯", ""):
             response_lines.pop()
-
-        # Remove leading empty lines
         while response_lines and not response_lines[0].strip():
             response_lines.pop(0)
 
@@ -1691,12 +2070,12 @@ class LiteClaw:
                     stable_count = 0
                 prev_content = cleaned
 
-                if has_prompt(content):
+                if is_idle_prompt(content):
                     prompt_count += 1
                 else:
                     prompt_count = 0
 
-                if (stable_count >= STABILITY_THRESHOLD and has_prompt(content)) or prompt_count >= 3:
+                if (stable_count >= STABILITY_THRESHOLD and is_idle_prompt(content)) or prompt_count >= 5:
                     break
 
                 await asyncio.sleep(POLL_INTERVAL)
@@ -1838,6 +2217,7 @@ class LiteClaw:
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         app.add_handler(CommandHandler("get", self.cmd_get))
+        app.add_handler(CommandHandler("recall", self.cmd_recall))
         app.add_handler(CommandHandler("agents", self.cmd_agents))
         app.add_handler(CommandHandler("agent", self.cmd_agent))
         app.add_handler(CommandHandler("assign", self.cmd_assign))

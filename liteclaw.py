@@ -572,7 +572,7 @@ class LiteClaw:
         self._load_agents()
         # Cron scheduler
         self._cron_jobs: list[dict] = []
-        self._cron_file = Path(__file__).parent / ".cron_jobs.json"
+        self._cron_file = Path(__file__).resolve().parent / ".cron_jobs.json"
         self._cron_running: set[str] = set()  # job ids currently executing
         self._load_cron_jobs()
 

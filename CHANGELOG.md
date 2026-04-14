@@ -1,12 +1,18 @@
 # Changelog
 
-## v0.4.3 (2026-04-14) — CLAUDE.md & Security Hardening
+## v0.4.3 (2026-04-14) — CLAUDE.md, Auth Heartbeat & Security Hardening
 
 ### Added
 - **CLAUDE.md**: Comprehensive technical reference for Claude Code integration
   - Architecture overview, component docs, multi-agent guardrails
   - 3-tier summarizer, auto-recovery, debugging guide
   - Performance tuning, extension points, filesystem layout
+- **Auth heartbeat**: Periodic `claude auth status` check every 30 minutes
+  - Detects expired sessions before they cause 401 errors
+  - Auto-initiates recovery flow when auth expires
+- **OAuth URL forwarding**: On 401, sends `/login` and forwards the OAuth URL to Telegram
+  - User taps the link on their phone to re-authenticate (2-min window)
+  - No more Node.js/Playwright dependency for OAuth auto-approval
 - **`PROXY_DIR` env variable**: API proxy directory is now configurable (was hardcoded)
 
 ### Fixed
@@ -16,6 +22,9 @@
 ### Changed
 - `.gitignore`: Added `.agents.json`, `.cron_jobs.json`, `.whale_state.json` to prevent accidental commit of runtime state files containing personal data
 - `.env.example`: Added `PROXY_DIR` entry
+
+### Removed
+- **`_auto_approve_oauth()`**: Replaced by OAuth URL forwarding to Telegram (no more Playwright/Node.js needed)
 
 ## v0.4.2 (2026-04-12) — Response Delivery Overhaul
 

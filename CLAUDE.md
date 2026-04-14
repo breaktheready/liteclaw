@@ -257,8 +257,14 @@ Ensures response delivery even when infrastructure is degraded.
 ### Session Auth Recovery (401)
 - Detects "401" + auth keywords in tmux pane output
 - Sends `/login` command to Claude Code session
-- Runs `auto_approve_oauth.js` to click OAuth approval automatically
-- Falls back to Telegram notification if auto-approval fails
+- Extracts OAuth URL from pane output and forwards to Telegram
+- User taps link on phone to approve (2-minute approval window)
+- Confirms re-authentication and notifies via Telegram
+
+### Auth Heartbeat
+- Runs `claude auth status` every 30 minutes (first check at 5 min after startup)
+- If auth expired: initiates recovery flow automatically
+- Prevents silent session death from undetected token expiry
 
 ### Telegram Send Recovery
 - 3x retry with exponential backoff on send failures
@@ -293,7 +299,8 @@ Ensures response delivery even when infrastructure is degraded.
 | Response polling | 45s (MAX_WAIT) | Force-deliver incomplete output |
 | Cron execution | 600s per job | Prevent runaway jobs |
 | Follow-up monitoring | 30 min | Catch resumed output |
-| OAuth auto-approve | 45s | Prevent hung browser |
+| OAuth URL approval window | 2 min | Wait for user to tap login link |
+| Auth heartbeat | 30 min | Detect expired sessions early |
 
 ### Process Management
 - **Single instance only**: Same bot token cannot be polled by two processes simultaneously
@@ -340,7 +347,6 @@ Direct `tmux send-keys -l` crashes on quotes, newlines, and special characters.
 4. `.env` configured with `BOT_TOKEN` and `CHAT_ID`
 5. **(Recommended)** OpenAI-compatible API proxy for Tier 1 summarization (e.g. Docker-based proxy at `SUMMARIZER_URL`)
 6. **(Optional)** Docker — only if API proxy runs in container (enables auto-recovery via `PROXY_DIR`)
-7. **(Optional)** Node.js — only for OAuth auto-recovery (`auto_approve_oauth.js`)
 
 ### Infrastructure: API Proxy
 LiteClaw's Tier 1 summarizer depends on an OpenAI-compatible API proxy.

@@ -53,7 +53,6 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
   - Example: [claude-max-api-proxy](https://github.com/1rgs/claude-max-openai-proxy) or any OpenAI-compatible endpoint
   - If using Docker: `docker compose up -d` in your proxy directory
 - **(Optional) Docker** — only needed if your API proxy runs in a container
-- **(Optional) Node.js** — only needed for OAuth auto-recovery (`auto_approve_oauth.js`)
 
 ---
 

@@ -2364,23 +2364,39 @@ class LiteClaw:
             return False
 
     async def _recover_session_auth(self, session: str) -> bool:
-        """Send /login to a Claude Code session and auto-approve OAuth if needed."""
+        """Send /login to a Claude Code session and forward OAuth URL to Telegram."""
         log.warning(f"Attempting to re-authenticate session: {session}")
         try:
             send_keys(session, "/login")
             send_enter(session)
 
-            # Wait for login to initiate — browser may open
+            # Wait for login to produce OAuth URL
             await asyncio.sleep(5)
 
-            # Check if OAuth approval is needed (browser opened)
-            content = capture_pane(session, lines=15)
-            if "oauth" in content.lower() or "browser" in content.lower() or "authorize" in content.lower():
-                log.info("OAuth browser detected, attempting auto-approve...")
-                await self._auto_approve_oauth()
+            # Extract OAuth URL from pane output
+            oauth_url = None
+            for _ in range(10):
+                content = capture_pane(session, lines=30)
+                # Look for OAuth/login URL patterns
+                for line in content.split("\n"):
+                    line = line.strip()
+                    if re.search(r"https://[^\s]*(?:oauth|authorize|login|auth)[^\s]*", line):
+                        match = re.search(r"(https://[^\s]+)", line)
+                        if match:
+                            oauth_url = match.group(1)
+                            break
+                if oauth_url:
+                    break
+                await asyncio.sleep(2)
 
-            # Wait for re-auth to complete
-            for _ in range(15):
+            if oauth_url:
+                log.info(f"OAuth URL found, forwarding to Telegram")
+                await self._send_oauth_url(session, oauth_url)
+            else:
+                log.info("No OAuth URL detected, checking if auto-login succeeded...")
+
+            # Wait for re-auth to complete (user clicks link on phone, or auto-login)
+            for _ in range(60):  # 2 min window for user to click
                 await asyncio.sleep(2)
                 content = capture_pane(session, lines=10)
                 if has_prompt(content) and "401" not in content:
@@ -2392,27 +2408,42 @@ class LiteClaw:
             log.warning(f"Re-auth failed for {session}: {e}")
         return False
 
-    async def _auto_approve_oauth(self):
-        """Run auto_approve_oauth.js to click the OAuth approve button."""
-        script = Path(__file__).parent / "auto_approve_oauth.js"
-        if not script.exists():
-            log.warning("auto_approve_oauth.js not found, skipping")
-            return
+    async def _send_oauth_url(self, session: str, url: str):
+        """Send OAuth login URL to Telegram so user can approve on phone."""
+        text = (
+            f"🔐 Session '{session}' needs re-authentication.\n\n"
+            f"Tap the link below to approve:\n{url}\n\n"
+            f"Waiting up to 2 minutes for approval..."
+        )
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "node", str(script),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
-            if proc.returncode == 0:
-                log.info(f"OAuth auto-approve success: {stdout.decode().strip()}")
-            else:
-                log.warning(f"OAuth auto-approve failed: {stderr.decode().strip()}")
-        except asyncio.TimeoutError:
-            log.warning("OAuth auto-approve timed out (45s)")
+            async with httpx.AsyncClient(timeout=10) as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": text},
+                )
         except Exception as e:
-            log.warning(f"OAuth auto-approve error: {e}")
+            log.warning(f"Failed to send OAuth URL to Telegram: {e}")
+
+    async def _heartbeat_check(self, context):
+        """Periodic auth health check. Detects expired sessions early."""
+        try:
+            r = subprocess.run(
+                ["claude", "auth", "status"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0 or '"loggedIn": false' in r.stdout or "error" in r.stdout.lower():
+                log.warning("Heartbeat: auth expired, attempting recovery")
+                await self._notify_recovery("Auth expired — initiating re-login...")
+                session = TMUX_TARGET
+                await self._recover_session_auth(session)
+            else:
+                log.debug("Heartbeat: auth OK")
+        except subprocess.TimeoutExpired:
+            log.warning("Heartbeat: claude auth status timed out")
+        except FileNotFoundError:
+            log.warning("Heartbeat: claude CLI not found")
+        except Exception as e:
+            log.warning(f"Heartbeat check failed: {e}")
 
     async def _notify_recovery(self, message: str):
         """Send recovery notification to Telegram."""
@@ -2643,6 +2674,12 @@ class LiteClaw:
             if self._cron_jobs:
                 self._schedule_cron_jobs(app.job_queue)
                 log.info(f"Cron scheduler initialized with {len(self._cron_jobs)} job(s)")
+            # Auth heartbeat: check every 30 minutes
+            app.job_queue.run_repeating(
+                self._heartbeat_check, interval=1800, first=300,
+                name="auth-heartbeat",
+            )
+            log.info("Auth heartbeat scheduled (every 30 min)")
 
         app = (
             Application.builder()

@@ -334,10 +334,13 @@ Direct `tmux send-keys -l` crashes on quotes, newlines, and special characters.
 ## Running
 
 ### Prerequisites
-1. Claude Code CLI installed and in PATH
-2. tmux installed
-3. `.env` configured with `BOT_TOKEN` and `CHAT_ID`
-4. API proxy running (optional — Tier 2/3 fallback available)
+1. **Python 3.10+** with venv
+2. **tmux 3.0+** installed
+3. **Claude Code CLI** installed, in PATH, and authenticated
+4. `.env` configured with `BOT_TOKEN` and `CHAT_ID`
+5. **(Recommended)** OpenAI-compatible API proxy for Tier 1 summarization (e.g. Docker-based proxy at `SUMMARIZER_URL`)
+6. **(Optional)** Docker — only if API proxy runs in container (enables auto-recovery via `PROXY_DIR`)
+7. **(Optional)** Node.js — only for OAuth auto-recovery (`auto_approve_oauth.js`)
 
 ### Infrastructure: API Proxy
 LiteClaw's Tier 1 summarizer depends on an OpenAI-compatible API proxy.

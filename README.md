@@ -42,6 +42,21 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
 
 ---
 
+## Prerequisites
+
+- **Python** 3.10+
+- **tmux** 3.0+
+- **Claude Code CLI** installed and authenticated (`claude --version` to verify)
+- **Telegram bot token** from [@BotFather](https://t.me/BotFather)
+- **(Recommended) OpenAI-compatible API proxy** for response summarization (Tier 1)
+  - Without it, LiteClaw falls back to a hidden Claude Code agent (Tier 2) or raw output (Tier 3)
+  - Example: [claude-max-api-proxy](https://github.com/1rgs/claude-max-openai-proxy) or any OpenAI-compatible endpoint
+  - If using Docker: `docker compose up -d` in your proxy directory
+- **(Optional) Docker** — only needed if your API proxy runs in a container
+- **(Optional) Node.js** — only needed for OAuth auto-recovery (`auto_approve_oauth.js`)
+
+---
+
 ## Quick Start
 
 ### Primary method: setup script

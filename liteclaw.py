@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from datetime import datetime
 from functools import partial
@@ -399,6 +400,34 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"lines": recent})
             except Exception as e:
                 self._send_json({"lines": [], "error": str(e)})
+        elif self.path == "/api/evolve":
+            evolve_dir = Path.home() / "projects/liteclaw/.evolve/data"
+            ideas_count = proposals_count = pending_proposals = rules_count = 0
+            if evolve_dir.exists():
+                ideas_file = evolve_dir / "ideas.jsonl"
+                proposals_file = evolve_dir / "proposals.jsonl"
+                rejections_file = evolve_dir / "rejections.jsonl"
+                if ideas_file.exists():
+                    ideas_count = sum(1 for _ in ideas_file.open())
+                if proposals_file.exists():
+                    for line in proposals_file.open():
+                        proposals_count += 1
+                        try:
+                            p = _json.loads(line)
+                            if p.get("decision") == "pending":
+                                pending_proposals += 1
+                        except Exception:
+                            pass
+                if rejections_file.exists():
+                    rules_count = sum(1 for _ in rejections_file.open())
+            skills = {k: v for k, v in self.bridge._skills.items()} if hasattr(self.bridge, '_skills') else {}
+            self._send_json({
+                "ideas": ideas_count,
+                "proposals": proposals_count,
+                "pending_proposals": pending_proposals,
+                "rejection_rules": rules_count,
+                "skills": skills,
+            })
         elif self.path == "/":
             self._send_html(DASHBOARD_HTML)
         else:
@@ -570,6 +599,10 @@ class LiteClaw:
         self._agents: dict[str, dict] = {}
         self._agents_file = Path(__file__).parent / ".agents.json"
         self._load_agents()
+        # Skill loader registry
+        self._skills: dict[str, dict] = {}
+        # Evolve proposal notification tracking
+        self._notified_proposals: set[str] = set()
         # Cron scheduler
         self._cron_jobs: list[dict] = []
         self._cron_file = Path(__file__).resolve().parent / ".cron_jobs.json"
@@ -602,6 +635,55 @@ class LiteClaw:
             self._agents_file.write_text(_json.dumps(self._agents, indent=2))
         except Exception as e:
             log.warning(f"Failed to save agents file: {e}")
+
+    def _load_skills(self):
+        """Load approved skill files from ~/.liteclaw-evolve/skills/"""
+        skills_dir = Path.home() / ".liteclaw-evolve" / "skills"
+        whitelist_path = skills_dir / "_whitelist.json"
+        if not skills_dir.exists():
+            return
+
+        approved = []
+        if whitelist_path.exists():
+            try:
+                approved = _json.loads(whitelist_path.read_text())
+            except Exception:
+                return
+
+        for skill_file in sorted(skills_dir.glob("*.py")):
+            if skill_file.name.startswith("_"):
+                continue
+            if skill_file.name not in approved:
+                log.info(f"Skill '{skill_file.name}' not in whitelist, skipping")
+                continue
+            try:
+                ns = {
+                    "capture_pane": capture_pane, "send_keys": send_keys,
+                    "send_enter": send_enter, "clean_output": clean_output,
+                    "log": log, "Path": Path, "subprocess": subprocess,
+                    "_json": _json, "asyncio": asyncio, "httpx": httpx,
+                }
+                exec(compile(skill_file.read_text(), str(skill_file), "exec"), ns)
+                cmd_name = ns.get("COMMAND")
+                handler_fn = ns.get("handler")
+                if cmd_name and handler_fn:
+                    claw_ref = self
+                    fn_ref = handler_fn
+                    async def _make_handler(fn, claw):
+                        async def _wrapped(update, ctx, _fn=fn, _claw=claw):
+                            if not _claw._auth(update):
+                                return
+                            await _fn(_claw, update, ctx)
+                        return _wrapped
+                    import asyncio as _aio
+                    loop = _aio.new_event_loop()
+                    wrapped = loop.run_until_complete(_make_handler(fn_ref, claw_ref))
+                    loop.close()
+                    self._app.add_handler(CommandHandler(cmd_name, wrapped))
+                    self._skills[cmd_name] = {"file": skill_file.name, "desc": ns.get("DESCRIPTION", "")}
+                    log.info(f"Skill loaded: /{cmd_name} from {skill_file.name}")
+            except Exception as e:
+                log.warning(f"Failed to load skill {skill_file.name}: {e}")
 
     # -- Cron job management --
 
@@ -833,7 +915,7 @@ class LiteClaw:
         else:
             self._log_offset = 0
 
-    def _log_conversation(self, user_text: str, response: str, summarized: bool = False):
+    def _log_conversation(self, user_text: str, response: str, summarized: bool = False, meta: dict = None):
         """Append a conversation turn to JSONL history file."""
         entry = {
             "ts": datetime.now().isoformat(),
@@ -841,11 +923,22 @@ class LiteClaw:
             "response": response[:2000],  # keep summarized version (compact)
             "summarized": summarized,
         }
+        if meta:
+            entry["meta"] = meta
         try:
             with open(HISTORY_FILE, "a", encoding="utf-8") as f:
                 f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
         except OSError as e:
             log.warning(f"Failed to write history: {e}")
+
+    def _log_event(self, event_type: str, detail: str = ""):
+        """Append behavioral event to ~/.liteclaw-events.jsonl"""
+        try:
+            entry = {"ts": datetime.now().isoformat(), "type": event_type, "detail": detail[:500]}
+            with open(Path.home() / ".liteclaw-events.jsonl", "a") as f:
+                f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
 
     def _read_new_output(self) -> str:
         """Read new output from pipe log since last recorded offset."""
@@ -922,8 +1015,10 @@ class LiteClaw:
             return
         if self._pipe_active:
             self._stop_pipe()
-        self.target = args[0]
+        new_target = args[0]
+        self.target = new_target
         self._start_pipe()
+        self._log_event("target_switch", f"target={new_target}")
         await update.message.reply_text(
             f"Target changed to: `{self.target}`", parse_mode="Markdown",
         )
@@ -934,6 +1029,7 @@ class LiteClaw:
         try:
             send_keys(self.target, "C-c", literal=False)
             self.busy = False
+            self._log_event("cancel")
             await update.message.reply_text("Sent Ctrl+C")
         except subprocess.CalledProcessError as e:
             await update.message.reply_text(f"Error: {e}")
@@ -951,6 +1047,7 @@ class LiteClaw:
         if not self._auth(update):
             return
         self.raw_mode = not self.raw_mode
+        self._log_event("mode_toggle", f"raw={'on' if self.raw_mode else 'off'}")
         mode = "ON (raw output)" if self.raw_mode else "OFF (summarized)"
         await update.message.reply_text(f"Raw mode: {mode}")
 
@@ -1069,6 +1166,7 @@ class LiteClaw:
                 "status": "starting",
             }
             self._save_agents()
+            self._log_event("agent_create", name)
 
             await update.message.reply_text(
                 f"Agent '{name}' created.\n"
@@ -1148,6 +1246,7 @@ class LiteClaw:
                 )
             del self._agents[name]
             self._save_agents()
+            self._log_event("agent_remove", name)
             await update.message.reply_text(f"Agent '{name}' removed.")
 
         else:
@@ -1255,6 +1354,7 @@ class LiteClaw:
                     await update.message.reply_text(f"Saved but failed to schedule: {e}")
                     return
 
+            self._log_event("cron_add", job_id)
             await update.message.reply_text(
                 f"✅ Cron job '{job_id}' added.\n"
                 f"Schedule: {cron_expr} (Asia/Seoul)\n"
@@ -1283,6 +1383,7 @@ class LiteClaw:
                 jobs = ctx.job_queue.get_jobs_by_name(f"cron-{job_id}")
                 for j in jobs:
                     j.schedule_removal()
+            self._log_event("cron_remove", job_id)
             await update.message.reply_text(f"✅ Cron job '{job_id}' removed.")
 
         elif subcmd in ("enable", "disable"):
@@ -1363,6 +1464,159 @@ class LiteClaw:
                 f"Unknown subcommand: {subcmd}\n"
                 "Usage: /cron list|add|remove|enable|disable|run|log"
             )
+
+    async def cmd_evolve(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Handle /evolve subcommands."""
+        if not self._auth(update):
+            return
+        args = ctx.args or []
+        subcmd = args[0].lower() if args else "status"
+
+        if subcmd == "status":
+            # Read evolve data files
+            evolve_dir = Path.home() / "projects/liteclaw/.evolve/data"
+            ideas_count = proposals_count = rules_count = 0
+            pending_proposals = 0
+            if evolve_dir.exists():
+                ideas_file = evolve_dir / "ideas.jsonl"
+                proposals_file = evolve_dir / "proposals.jsonl"
+                rejections_file = evolve_dir / "rejections.jsonl"
+                if ideas_file.exists():
+                    ideas_count = sum(1 for _ in ideas_file.open())
+                if proposals_file.exists():
+                    for line in proposals_file.open():
+                        proposals_count += 1
+                        try:
+                            p = _json.loads(line)
+                            if p.get("decision") == "pending":
+                                pending_proposals += 1
+                        except Exception:
+                            pass
+                if rejections_file.exists():
+                    rules_count = sum(1 for _ in rejections_file.open())
+
+            skills_list = ", ".join(f"/{k}" for k in self._skills) or "(none)"
+            text = (
+                f"🧬 Evolution Status\n\n"
+                f"Ideas: {ideas_count}\n"
+                f"Proposals: {proposals_count} ({pending_proposals} pending)\n"
+                f"Rejection rules: {rules_count}\n"
+                f"Skills loaded: {skills_list}\n"
+            )
+            await update.message.reply_text(text)
+
+        elif subcmd == "ideas":
+            evolve_dir = Path.home() / "projects/liteclaw/.evolve/data"
+            ideas_file = evolve_dir / "ideas.jsonl"
+            if not ideas_file.exists():
+                await update.message.reply_text("No ideas yet.")
+                return
+            ideas = []
+            for line in ideas_file.open():
+                try:
+                    ideas.append(_json.loads(line))
+                except Exception:
+                    pass
+            pending = [i for i in ideas if i.get("status") == "pending"][-5:]
+            if not pending:
+                await update.message.reply_text("No pending ideas.")
+                return
+            lines = []
+            for i in pending:
+                f = i.get("fitness", {})
+                lines.append(f"• [{i['id'][:8]}] {i['title'][:60]} (F:{f.get('total', 0):.2f})")
+            await update.message.reply_text("💡 Pending Ideas:\n\n" + "\n".join(lines))
+
+        elif subcmd == "approve" and len(args) >= 2:
+            proposal_id = args[1]
+            await update.message.reply_text(f"⏳ Building proposal {proposal_id}...")
+            self._log_event("evolve_approve", proposal_id)
+            # Build runs in ephemeral session via cron system
+            try:
+                r = subprocess.run(
+                    ["node", str(Path.home() / "projects/evolve-engine/dist/bin/evolve.js"), "build", proposal_id],
+                    cwd=str(Path.home() / "projects/liteclaw"),
+                    capture_output=True, text=True, timeout=300,
+                )
+                if r.returncode == 0:
+                    await update.message.reply_text(f"✅ Build complete for {proposal_id}.\nCheck branch and merge manually to activate.")
+                else:
+                    await update.message.reply_text(f"❌ Build failed:\n{r.stderr[:500]}")
+            except subprocess.TimeoutExpired:
+                await update.message.reply_text("❌ Build timed out (300s)")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Build error: {e}")
+
+        elif subcmd == "reject" and len(args) >= 2:
+            proposal_id = args[1]
+            reason = " ".join(args[2:]) or "No reason given"
+            self._log_event("evolve_reject", f"{proposal_id}: {reason}")
+            try:
+                r = subprocess.run(
+                    ["node", str(Path.home() / "projects/evolve-engine/dist/bin/evolve.js"), "reject", proposal_id, reason],
+                    cwd=str(Path.home() / "projects/liteclaw"),
+                    capture_output=True, text=True, timeout=60,
+                )
+                if r.returncode == 0:
+                    await update.message.reply_text(f"🚫 Rejected {proposal_id}. Rule learned.")
+                else:
+                    await update.message.reply_text(f"❌ Reject failed: {r.stderr[:300]}")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Error: {e}")
+
+        elif subcmd == "skill":
+            skill_subcmd = args[1].lower() if len(args) > 1 else "list"
+            if skill_subcmd == "list":
+                if not self._skills:
+                    await update.message.reply_text("No skills loaded.")
+                    return
+                lines = [f"• /{k} — {v['desc']} ({v['file']})" for k, v in self._skills.items()]
+                await update.message.reply_text("🔧 Loaded Skills:\n\n" + "\n".join(lines))
+            elif skill_subcmd == "reload":
+                old_count = len(self._skills)
+                self._load_skills()
+                new_count = len(self._skills)
+                await update.message.reply_text(f"♻️ Skills reloaded. {old_count} → {new_count}")
+            else:
+                await update.message.reply_text("Usage: /evolve skill list|reload")
+
+        else:
+            await update.message.reply_text(
+                "Usage:\n"
+                "/evolve status — Show evolution status\n"
+                "/evolve ideas — Show pending ideas\n"
+                "/evolve approve <id> — Approve proposal\n"
+                "/evolve reject <id> [reason] — Reject proposal\n"
+                "/evolve skill list|reload — Manage skills"
+            )
+
+    async def _check_evolve_proposals(self, context):
+        """Check for new pending proposals and notify via Telegram."""
+        proposals_file = Path.home() / "projects/liteclaw/.evolve/data/proposals.jsonl"
+        if not proposals_file.exists():
+            return
+        try:
+            for line in proposals_file.open():
+                try:
+                    p = _json.loads(line)
+                    if p.get("decision") == "pending" and p["id"] not in self._notified_proposals:
+                        text = (
+                            f"💡 New Evolution Proposal\n\n"
+                            f"{p.get('summary', 'No summary')[:300]}\n\n"
+                            f"ID: {p['id']}\n"
+                            f"/evolve approve {p['id']}\n"
+                            f"/evolve reject {p['id']} [reason]"
+                        )
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            await client.post(
+                                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                                json={"chat_id": CHAT_ID, "text": text},
+                            )
+                        self._notified_proposals.add(p["id"])
+                except Exception:
+                    pass
+        except Exception as e:
+            log.debug(f"Proposal check error: {e}")
 
     async def cmd_assign(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Assign a task to an agent and poll for response."""
@@ -1802,6 +2056,7 @@ class LiteClaw:
             await update.message.reply_text("⏳ Still processing. Use /cancel to abort.")
             return
 
+        t0 = time.monotonic()
         self.busy = True
         self._last_activity = datetime.now().isoformat()
         log.info(f"Received: {user_text[:80]}...")
@@ -1855,8 +2110,18 @@ class LiteClaw:
                     except Exception:
                         pass
 
+            # Compute timing meta for conversation logging
+            now = datetime.now()
+            _conv_meta = {
+                "response_ms": int((time.monotonic() - t0) * 1000),
+                "raw_len": len(response),
+                "target": self.target,
+                "hour": now.hour,
+                "weekday": now.weekday(),
+            }
+
             # Deliver response (with persistent retry)
-            delivered_msg_id = await self._deliver_response(response, user_text, update, ctx)
+            delivered_msg_id = await self._deliver_response(response, user_text, update, ctx, meta=_conv_meta)
 
             # Schedule follow-up check: if Claude produces more output, edit the message
             if delivered_msg_id:
@@ -1887,7 +2152,7 @@ class LiteClaw:
         finally:
             self.busy = False
 
-    async def _deliver_response(self, response: str, user_text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> int | None:
+    async def _deliver_response(self, response: str, user_text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE, meta: dict = None) -> int | None:
         """Deliver response to Telegram with retry. Summarizes unless raw mode. Returns last message_id."""
         if not response.strip():
             await update.message.reply_text("(empty response)")
@@ -1939,8 +2204,10 @@ class LiteClaw:
             if i < len(chunks) - 1:
                 await asyncio.sleep(0.5)
 
-        # Log conversation to history
-        self._log_conversation(user_text, response, summarized=not self.raw_mode)
+        # Log conversation to history (add sum_len to meta if available)
+        if meta is not None:
+            meta["sum_len"] = len(response)
+        self._log_conversation(user_text, response, summarized=not self.raw_mode, meta=meta)
         return last_msg_id
 
     async def _followup_edit(self, user_text: str, pre_snapshot: str, msg_id: int, bot):
@@ -2680,6 +2947,14 @@ class LiteClaw:
                 name="auth-heartbeat",
             )
             log.info("Auth heartbeat scheduled (every 30 min)")
+            # Load skills from evolve system
+            self._load_skills()
+            # Evolve proposal checker: every 30 min, first check at 10 min
+            app.job_queue.run_repeating(
+                self._check_evolve_proposals, interval=1800, first=600,
+                name="evolve-proposal-check",
+            )
+            log.info("Evolve proposal checker scheduled (every 30 min)")
 
         app = (
             Application.builder()
@@ -2691,6 +2966,7 @@ class LiteClaw:
             .connect_timeout(15)
             .build()
         )
+        self._app = app
 
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_start))
@@ -2707,6 +2983,7 @@ class LiteClaw:
         app.add_handler(CommandHandler("agent", self.cmd_agent))
         app.add_handler(CommandHandler("assign", self.cmd_assign))
         app.add_handler(CommandHandler("cron", self.cmd_cron))
+        app.add_handler(CommandHandler("evolve", self.cmd_evolve))
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))

@@ -9,3 +9,4 @@ DEVNOTES.md
 .agents.json
 .cron_jobs.json
 .whale_state.json
+.evolve/

@@ -26,10 +26,12 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 from datetime import datetime
 from functools import partial
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
@@ -320,13 +322,20 @@ SUMMARIZE_PROMPT = """You are a concise assistant that reformats Claude Code CLI
 Rules:
 - Extract the meaningful response, discard terminal noise (tool calls, file reads, status lines, hook messages)
 - Keep code blocks, commands, key decisions, and action items intact
-- Use Telegram-friendly Markdown (bold, code blocks, bullet points)
 - Respond in the same language as the user's question
 - If the output contains an error, highlight it clearly
-- For long outputs: summarize into structured sections with headers, don't just truncate
-- If the output contains a plan or list: preserve the structure and all items
 - Keep it concise but NEVER drop important content — completeness over brevity
-- Do NOT add your own commentary — just reformat what Claude said"""
+- Do NOT add your own commentary — just reformat what Claude said
+
+Telegram formatting rules (IMPORTANT):
+- NO markdown tables (|---|) — Telegram can't render them. Use bullet points instead:
+  • "항목: 설명" or "항목 → 설명" format
+- NO # headers — use **bold text** for section titles
+- Use bullet points (•, -, ◦) for lists
+- Use `code` for inline code, triple backticks for code blocks
+- Use **bold** for emphasis, not ALL CAPS
+- Keep lines short — long lines wrap badly on mobile
+- Separate sections with blank lines, not horizontal rules"""
 
 
 
@@ -561,6 +570,11 @@ class LiteClaw:
         self._agents: dict[str, dict] = {}
         self._agents_file = Path(__file__).parent / ".agents.json"
         self._load_agents()
+        # Cron scheduler
+        self._cron_jobs: list[dict] = []
+        self._cron_file = Path(__file__).parent / ".cron_jobs.json"
+        self._cron_running: set[str] = set()  # job ids currently executing
+        self._load_cron_jobs()
 
     def _load_agents(self):
         """Load agent registry from .agents.json."""
@@ -588,6 +602,184 @@ class LiteClaw:
             self._agents_file.write_text(_json.dumps(self._agents, indent=2))
         except Exception as e:
             log.warning(f"Failed to save agents file: {e}")
+
+    # -- Cron job management --
+
+    def _load_cron_jobs(self):
+        """Load cron jobs from .cron_jobs.json."""
+        if self._cron_file.exists():
+            try:
+                self._cron_jobs = _json.loads(self._cron_file.read_text())
+                log.info(f"Loaded {len(self._cron_jobs)} cron job(s)")
+            except Exception as e:
+                log.warning(f"Failed to load cron jobs: {e}")
+                self._cron_jobs = []
+
+    def _save_cron_jobs(self):
+        """Persist cron jobs to .cron_jobs.json."""
+        try:
+            self._cron_file.write_text(_json.dumps(self._cron_jobs, indent=2))
+        except Exception as e:
+            log.warning(f"Failed to save cron jobs: {e}")
+
+    def _get_cron_job(self, job_id: str) -> dict | None:
+        """Find a cron job by id."""
+        for job in self._cron_jobs:
+            if job["id"] == job_id:
+                return job
+        return None
+
+    def _schedule_cron_jobs(self, job_queue):
+        """Register all enabled cron jobs with the bot's JobQueue."""
+        from apscheduler.triggers.cron import CronTrigger
+
+        for job in self._cron_jobs:
+            if not job.get("enabled", True):
+                continue
+            try:
+                tz = job.get("tz", "Asia/Seoul")
+                trigger = CronTrigger.from_crontab(job["cron_expr"], timezone=tz)
+                job_queue.run_custom(
+                    callback=self._run_cron_job,
+                    job_kwargs={
+                        "trigger": trigger,
+                        "id": f"cron-{job['id']}",
+                        "replace_existing": True,
+                    },
+                    data=job,
+                )
+                log.info(f"Cron job '{job['id']}' scheduled: {job['cron_expr']} ({tz})")
+            except Exception as e:
+                log.warning(f"Failed to schedule cron job '{job['id']}': {e}")
+
+    async def _run_cron_job(self, context):
+        """Execute a single cron job. Called by APScheduler."""
+        job = context.job.data
+        job_id = job["id"]
+        session_name = f"cron-{job_id}"
+        bot = context.bot
+
+        # Overlap prevention
+        if job_id in self._cron_running:
+            log.info(f"Cron '{job_id}' already running, skipping")
+            return
+        self._cron_running.add(job_id)
+
+        now = datetime.now(ZoneInfo(job.get("tz", "Asia/Seoul")))
+        log.info(f"Cron '{job_id}' starting at {now.strftime('%H:%M:%S')}")
+
+        try:
+            # Ensure tmux session exists
+            if not self._agent_session_alive(session_name):
+                project = job.get("project", "~")
+                subprocess.run(
+                    ["tmux", "new-session", "-d", "-s", session_name,
+                     "-x", "200", "-y", "50"],
+                    check=True, capture_output=True,
+                )
+                subprocess.run(
+                    ["tmux", "send-keys", "-t", session_name,
+                     f"cd {project} && claude --dangerously-skip-permissions", "Enter"],
+                    check=True,
+                )
+                # Wait for Claude Code prompt
+                for _ in range(30):
+                    await asyncio.sleep(1)
+                    try:
+                        content = capture_pane(session_name, lines=10)
+                        if has_prompt(content):
+                            break
+                    except RuntimeError:
+                        pass
+                else:
+                    raise TimeoutError("Claude Code prompt not detected after 30s")
+
+            # Wait if session is busy
+            for _ in range(60):  # max 60s wait
+                pane = capture_pane(session_name, lines=15)
+                if is_idle_prompt(pane):
+                    break
+                await asyncio.sleep(2)
+            else:
+                raise TimeoutError("Session busy for 120s, giving up")
+
+            # Send the message
+            message = job["message"]
+            send_keys(session_name, message, literal=True)
+            send_enter(session_name)
+
+            # Poll for response with job-specific timeout
+            timeout = job.get("timeout", 600)
+            prev_content = ""
+            prompt_count = 0
+            elapsed = 0.0
+            await asyncio.sleep(3)
+            elapsed += 3
+
+            while elapsed < timeout:
+                pane_content = capture_pane(session_name, lines=15)
+                if is_idle_prompt(pane_content):
+                    prompt_count += 1
+                else:
+                    prompt_count = 0
+
+                if elapsed >= 5 and prompt_count >= 5:
+                    break
+
+                await asyncio.sleep(POLL_INTERVAL)
+                elapsed += POLL_INTERVAL
+            else:
+                log.warning(f"Cron '{job_id}' timed out after {timeout}s")
+
+            # Extract response
+            full_capture = capture_pane(session_name, lines=SCROLLBACK_LINES)
+            response = self._extract_response(full_capture, message)
+
+            if elapsed >= timeout:
+                response += "\n\n⚠️ [TIMEOUT]"
+
+            # Summarize if available
+            if not self.raw_mode and self._api_available:
+                try:
+                    response = await asyncio.wait_for(
+                        self._summarize(message, response),
+                        timeout=60.0,
+                    )
+                except (asyncio.TimeoutError, Exception):
+                    pass  # use raw response
+
+            # Deliver to Telegram
+            header = f"🕐 Cron: {job_id}\n\n"
+            for chunk in split_message(header + response):
+                try:
+                    await bot.send_message(chat_id=CHAT_ID, text=chunk)
+                except Exception:
+                    async with httpx.AsyncClient(timeout=60) as client:
+                        await client.post(
+                            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                            json={"chat_id": CHAT_ID, "text": chunk},
+                        )
+
+            # Update job state
+            job["last_run"] = now.isoformat()
+            job["last_status"] = "ok" if elapsed < timeout else "timeout"
+            self._save_cron_jobs()
+            log.info(f"Cron '{job_id}' completed in {elapsed:.0f}s")
+
+        except Exception as e:
+            log.error(f"Cron '{job_id}' failed: {e}")
+            job["last_run"] = datetime.now(ZoneInfo(job.get("tz", "Asia/Seoul"))).isoformat()
+            job["last_status"] = f"error: {e}"
+            self._save_cron_jobs()
+            try:
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"❌ Cron '{job_id}' failed: {e}",
+                )
+            except Exception:
+                pass
+        finally:
+            self._cron_running.discard(job_id)
 
     def _agent_session_alive(self, session: str) -> bool:
         """Check if a tmux session is still running."""
@@ -696,7 +888,12 @@ class LiteClaw:
             "/agent new NAME PATH — create agent\n"
             "/agent status — detailed agent status\n"
             "/agent remove NAME — remove agent\n"
-            "/assign NAME task — assign task to agent",
+            "/assign NAME task — assign task to agent\n\n"
+            "Cron:\n"
+            "/cron list — show scheduled jobs\n"
+            "/cron add — add a new job\n"
+            "/cron run ID — manual trigger\n"
+            "/cron enable|disable ID — toggle job",
             parse_mode="Markdown",
         )
 
@@ -957,6 +1154,214 @@ class LiteClaw:
             await update.message.reply_text(
                 f"Unknown subcommand: {subcmd}\n"
                 "Usage: /agent new|status|remove"
+            )
+
+    async def cmd_cron(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Handle /cron subcommands: list, add, remove, enable, disable, run."""
+        if not self._auth(update):
+            return
+        args = ctx.args
+        if not args:
+            await update.message.reply_text(
+                "Usage:\n"
+                "/cron list\n"
+                "/cron add <id> <cron_expr(5)> <project> <message...>\n"
+                "/cron remove <id>\n"
+                "/cron enable <id>\n"
+                "/cron disable <id>\n"
+                "/cron run <id>\n"
+                "/cron log <id>\n\n"
+                "Example:\n"
+                "/cron add daily-report 0 19 * * 1-5 ~/my-project Generate daily report"
+            )
+            return
+
+        subcmd = args[0].lower()
+
+        if subcmd == "list":
+            if not self._cron_jobs:
+                await update.message.reply_text("No cron jobs configured.")
+                return
+            lines = []
+            for job in self._cron_jobs:
+                icon = "✅" if job.get("enabled", True) else "⏸️"
+                status = job.get("last_status", "never run")
+                last = job.get("last_run", "-")
+                if last and last != "-":
+                    try:
+                        last = last.split("T")[0] + " " + last.split("T")[1][:5]
+                    except Exception:
+                        pass
+                running = " 🔄" if job["id"] in self._cron_running else ""
+                lines.append(
+                    f"{icon} {job['id']}{running}\n"
+                    f"   Schedule: {job['cron_expr']} ({job.get('tz', 'Asia/Seoul')})\n"
+                    f"   Project: {job.get('project', '~')}\n"
+                    f"   Timeout: {job.get('timeout', 600)}s\n"
+                    f"   Last: {last} [{status}]"
+                )
+            await update.message.reply_text("Cron Jobs:\n\n" + "\n\n".join(lines))
+
+        elif subcmd == "add":
+            # /cron add <id> <m> <h> <dom> <mon> <dow> <project> <message...>
+            if len(args) < 9:
+                await update.message.reply_text(
+                    "Usage: /cron add <id> <min> <hour> <dom> <mon> <dow> <project> <message...>\n"
+                    "Example: /cron add my-job 0 19 * * 1-5 ~/projects/foo Run the thing"
+                )
+                return
+            job_id = args[1]
+            cron_expr = " ".join(args[2:7])  # 5 cron fields
+            project = args[7]
+            message = " ".join(args[8:])
+
+            if self._get_cron_job(job_id):
+                await update.message.reply_text(f"Job '{job_id}' already exists. Remove it first.")
+                return
+
+            # Validate cron expression
+            try:
+                from apscheduler.triggers.cron import CronTrigger
+                CronTrigger.from_crontab(cron_expr, timezone="Asia/Seoul")
+            except Exception as e:
+                await update.message.reply_text(f"Invalid cron expression: {e}")
+                return
+
+            job = {
+                "id": job_id,
+                "enabled": True,
+                "cron_expr": cron_expr,
+                "tz": "Asia/Seoul",
+                "message": message,
+                "timeout": 600,
+                "project": project,
+                "last_run": None,
+                "last_status": None,
+            }
+            self._cron_jobs.append(job)
+            self._save_cron_jobs()
+
+            # Register with scheduler if running
+            if hasattr(ctx, "job_queue") and ctx.job_queue:
+                try:
+                    from apscheduler.triggers.cron import CronTrigger
+                    trigger = CronTrigger.from_crontab(cron_expr, timezone="Asia/Seoul")
+                    ctx.job_queue.run_custom(
+                        callback=self._run_cron_job,
+                        job_kwargs={"trigger": trigger, "id": f"cron-{job_id}", "replace_existing": True},
+                        data=job,
+                    )
+                except Exception as e:
+                    await update.message.reply_text(f"Saved but failed to schedule: {e}")
+                    return
+
+            await update.message.reply_text(
+                f"✅ Cron job '{job_id}' added.\n"
+                f"Schedule: {cron_expr} (Asia/Seoul)\n"
+                f"Project: {project}\n"
+                f"Message: {message[:100]}{'...' if len(message) > 100 else ''}\n\n"
+                "Restart LiteClaw to activate, or use /cron run to test."
+            )
+
+        elif subcmd == "remove":
+            if len(args) < 2:
+                await update.message.reply_text("Usage: /cron remove <id>")
+                return
+            job_id = args[1]
+            job = self._get_cron_job(job_id)
+            if not job:
+                await update.message.reply_text(f"Job '{job_id}' not found.")
+                return
+            self._cron_jobs.remove(job)
+            self._save_cron_jobs()
+            # Kill tmux session if exists
+            session_name = f"cron-{job_id}"
+            if self._agent_session_alive(session_name):
+                subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+            # Remove from scheduler
+            if ctx.job_queue:
+                jobs = ctx.job_queue.get_jobs_by_name(f"cron-{job_id}")
+                for j in jobs:
+                    j.schedule_removal()
+            await update.message.reply_text(f"✅ Cron job '{job_id}' removed.")
+
+        elif subcmd in ("enable", "disable"):
+            if len(args) < 2:
+                await update.message.reply_text(f"Usage: /cron {subcmd} <id>")
+                return
+            job_id = args[1]
+            job = self._get_cron_job(job_id)
+            if not job:
+                await update.message.reply_text(f"Job '{job_id}' not found.")
+                return
+            enabled = subcmd == "enable"
+            job["enabled"] = enabled
+            self._save_cron_jobs()
+
+            if ctx.job_queue:
+                if enabled:
+                    try:
+                        from apscheduler.triggers.cron import CronTrigger
+                        trigger = CronTrigger.from_crontab(job["cron_expr"], timezone=job.get("tz", "Asia/Seoul"))
+                        ctx.job_queue.run_custom(
+                            callback=self._run_cron_job,
+                            job_kwargs={"trigger": trigger, "id": f"cron-{job_id}", "replace_existing": True},
+                            data=job,
+                        )
+                    except Exception:
+                        pass
+                else:
+                    jobs = ctx.job_queue.get_jobs_by_name(f"cron-{job_id}")
+                    for j in jobs:
+                        j.schedule_removal()
+
+            icon = "✅" if enabled else "⏸️"
+            await update.message.reply_text(f"{icon} Cron job '{job_id}' {'enabled' if enabled else 'disabled'}.")
+
+        elif subcmd == "run":
+            if len(args) < 2:
+                await update.message.reply_text("Usage: /cron run <id>")
+                return
+            job_id = args[1]
+            job = self._get_cron_job(job_id)
+            if not job:
+                await update.message.reply_text(f"Job '{job_id}' not found.")
+                return
+            if job_id in self._cron_running:
+                await update.message.reply_text(f"Job '{job_id}' is already running.")
+                return
+            await update.message.reply_text(f"🚀 Running cron job '{job_id}'...")
+
+            # Create a minimal context-like object for _run_cron_job
+            class _FakeJobContext:
+                def __init__(self, bot, data):
+                    self.bot = bot
+                    self.job = type("obj", (object,), {"data": data})()
+            fake_ctx = _FakeJobContext(ctx.bot, job)
+            asyncio.create_task(self._run_cron_job(fake_ctx))
+
+        elif subcmd == "log":
+            if len(args) < 2:
+                await update.message.reply_text("Usage: /cron log <id>")
+                return
+            job_id = args[1]
+            job = self._get_cron_job(job_id)
+            if not job:
+                await update.message.reply_text(f"Job '{job_id}' not found.")
+                return
+            last = job.get("last_run", "never")
+            status = job.get("last_status", "never run")
+            running = " (currently running)" if job_id in self._cron_running else ""
+            await update.message.reply_text(
+                f"Cron: {job_id}{running}\n"
+                f"Last run: {last}\n"
+                f"Status: {status}"
+            )
+
+        else:
+            await update.message.reply_text(
+                f"Unknown subcommand: {subcmd}\n"
+                "Usage: /cron list|add|remove|enable|disable|run|log"
             )
 
     async def cmd_assign(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1542,13 +1947,12 @@ class LiteClaw:
         """Continuously monitor pane and edit delivered message until Claude truly finishes.
         Keeps updating even after apparent completion — re-checks to catch resumed work."""
         await asyncio.sleep(15)
-        last_delivered = ""  # track what we last sent to avoid "not modified" errors
-        rounds_unchanged = 0  # consecutive rounds where extracted content didn't change
+        last_delivered_raw = ""  # raw text for comparison (pre-summarization)
+        rounds_unchanged = 0  # consecutive rounds where RAW content didn't change
         elapsed = 0
-        max_followup = 300  # 5 minutes max follow-up time
         notified_late_edit = False  # only notify once about late updates
 
-        while rounds_unchanged < 3 and elapsed < max_followup:
+        while rounds_unchanged < 3:  # 3 consecutive unchanged = truly done (no time limit)
             # Wait for idle
             prompt_count = 0
             while True:
@@ -1565,8 +1969,8 @@ class LiteClaw:
 
                     elapsed += 5
 
-                    # Status edit every 30s while waiting
-                    if elapsed % 30 == 0:
+                    # Status edit every 30s while waiting — only if no real content delivered yet
+                    if elapsed % 30 == 0 and not last_delivered_raw:
                         status_text = clean_output(pane).strip()
                         preview = "\n".join(
                             [l for l in status_text.split("\n") if l.strip()][-3:]
@@ -1590,33 +1994,33 @@ class LiteClaw:
             # Idle detected — extract and update
             try:
                 full = capture_pane(self.target, lines=SCROLLBACK_LINES)
-                new_response = self._extract_response(full, user_text, pre_snapshot)
-                if not new_response.strip():
+                new_raw = self._extract_response(full, user_text, pre_snapshot)
+                if not new_raw.strip():
                     rounds_unchanged += 1
                     await asyncio.sleep(30)
                     elapsed += 30
                     continue
 
-                if not self.raw_mode:
-                    try:
-                        new_response = await asyncio.wait_for(
-                            self._summarize(user_text, new_response),
-                            timeout=30.0,
-                        )
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Check if content actually changed
-                if new_response.strip() == last_delivered.strip():
+                # Compare RAW text (before summarization) to detect real changes
+                if new_raw.strip() == last_delivered_raw.strip():
                     rounds_unchanged += 1
                     log.info(f"Follow-up: content unchanged (round {rounds_unchanged}/3)")
                     await asyncio.sleep(30)
                     elapsed += 30
                     continue
 
-                # Content changed — update message
+                # Content changed — summarize and update
                 rounds_unchanged = 0
-                last_delivered = new_response
+                last_delivered_raw = new_raw
+                new_response = new_raw
+                if not self.raw_mode:
+                    try:
+                        new_response = await asyncio.wait_for(
+                            self._summarize(user_text, new_raw),
+                            timeout=30.0,
+                        )
+                    except asyncio.TimeoutError:
+                        pass
                 chunks = split_message(new_response)
                 if len(chunks) == 1:
                     try:
@@ -1665,7 +2069,7 @@ class LiteClaw:
         try:
             full = capture_pane(self.target, lines=SCROLLBACK_LINES)
             final_response = self._extract_response(full, user_text, pre_snapshot)
-            if final_response.strip() and final_response.strip() != last_delivered.strip():
+            if final_response.strip() and final_response.strip() != last_delivered_raw.strip():
                 if not self.raw_mode:
                     try:
                         final_response = await asyncio.wait_for(
@@ -1938,7 +2342,7 @@ class LiteClaw:
         try:
             r = subprocess.run(
                 ["docker", "compose", "up", "-d"],
-                cwd="/home/breaktheready/projects/max_api_proxy",
+                cwd=os.environ.get("PROXY_DIR", os.path.expanduser("~/max_api_proxy")),
                 capture_output=True, text=True, timeout=30,
             )
             if r.returncode == 0:
@@ -1960,11 +2364,22 @@ class LiteClaw:
             return False
 
     async def _recover_session_auth(self, session: str) -> bool:
-        """Send /login to a Claude Code session to re-authenticate."""
+        """Send /login to a Claude Code session and auto-approve OAuth if needed."""
         log.warning(f"Attempting to re-authenticate session: {session}")
         try:
             send_keys(session, "/login")
             send_enter(session)
+
+            # Wait for login to initiate — browser may open
+            await asyncio.sleep(5)
+
+            # Check if OAuth approval is needed (browser opened)
+            content = capture_pane(session, lines=15)
+            if "oauth" in content.lower() or "browser" in content.lower() or "authorize" in content.lower():
+                log.info("OAuth browser detected, attempting auto-approve...")
+                await self._auto_approve_oauth()
+
+            # Wait for re-auth to complete
             for _ in range(15):
                 await asyncio.sleep(2)
                 content = capture_pane(session, lines=10)
@@ -1976,6 +2391,28 @@ class LiteClaw:
         except Exception as e:
             log.warning(f"Re-auth failed for {session}: {e}")
         return False
+
+    async def _auto_approve_oauth(self):
+        """Run auto_approve_oauth.js to click the OAuth approve button."""
+        script = Path(__file__).parent / "auto_approve_oauth.js"
+        if not script.exists():
+            log.warning("auto_approve_oauth.js not found, skipping")
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "node", str(script),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=45)
+            if proc.returncode == 0:
+                log.info(f"OAuth auto-approve success: {stdout.decode().strip()}")
+            else:
+                log.warning(f"OAuth auto-approve failed: {stderr.decode().strip()}")
+        except asyncio.TimeoutError:
+            log.warning("OAuth auto-approve timed out (45s)")
+        except Exception as e:
+            log.warning(f"OAuth auto-approve error: {e}")
 
     async def _notify_recovery(self, message: str):
         """Send recovery notification to Telegram."""
@@ -2196,10 +2633,21 @@ class LiteClaw:
         """Start the bot."""
         async def on_shutdown(app):
             self._cleanup_summarizer()
+            # Kill cron tmux sessions
+            for job in self._cron_jobs:
+                session_name = f"cron-{job['id']}"
+                if self._agent_session_alive(session_name):
+                    subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+
+        async def on_init(app):
+            if self._cron_jobs:
+                self._schedule_cron_jobs(app.job_queue)
+                log.info(f"Cron scheduler initialized with {len(self._cron_jobs)} job(s)")
 
         app = (
             Application.builder()
             .token(BOT_TOKEN)
+            .post_init(on_init)
             .post_shutdown(on_shutdown)
             .read_timeout(30)
             .write_timeout(30)
@@ -2221,6 +2669,7 @@ class LiteClaw:
         app.add_handler(CommandHandler("agents", self.cmd_agents))
         app.add_handler(CommandHandler("agent", self.cmd_agent))
         app.add_handler(CommandHandler("assign", self.cmd_assign))
+        app.add_handler(CommandHandler("cron", self.cmd_cron))
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))

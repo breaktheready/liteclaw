@@ -107,6 +107,10 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 | `INTERMEDIATE_INTERVAL` | `10` | Seconds between progress updates while Claude works |
 | `STAGING_DIR` | `~/liteclaw-files` | Directory where uploaded files are saved on the server |
 | `EXTRA_PROMPT_PATTERNS` | (empty) | Comma-separated regex patterns for custom prompt detection |
+| `PROXY_DIR` | `~/max_api_proxy` | API proxy directory for auto-recovery (`docker compose up -d`) |
+| `DASHBOARD_PORT` | `7777` | Web dashboard port (set `0` to disable) |
+| `HISTORY_FILE` | `~/.liteclaw-history.jsonl` | Conversation history location |
+| `HISTORY_RECALL_LIMIT` | `50` | Max entries returned by `/recall` |
 
 ---
 
@@ -126,6 +130,27 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 | `/get FILEPATH` | Download a file from the server to Telegram |
 | Send a document | Upload a file to `STAGING_DIR` and relay its path (and contents for small files) to Claude |
 | Send a photo | Upload a photo to `STAGING_DIR` and relay the path to Claude for vision tasks |
+
+### Multi-Agent Commands
+
+| Command | Description |
+|---------|-------------|
+| `/agents` | List all registered agents |
+| `/agent new NAME PATH` | Create a new Claude Code agent in a dedicated tmux session |
+| `/agent status` | Detailed status of all agents with pane preview |
+| `/agent remove NAME` | Kill agent tmux session and unregister |
+| `/assign NAME TASK` | Send a task to a named agent and relay the response |
+
+### Cron Commands
+
+| Command | Description |
+|---------|-------------|
+| `/cron list` | Show all scheduled jobs |
+| `/cron add ID CRON(5) PROJECT MSG` | Create a new cron job (5-field cron expression) |
+| `/cron remove ID` | Delete and unschedule a job |
+| `/cron enable/disable ID` | Toggle job execution |
+| `/cron run ID` | Manual trigger for testing |
+| `/cron log ID` | Show last run time and status |
 
 ### Command details
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## v0.4.3 (2026-04-14) — CLAUDE.md & Security Hardening
+
+### Added
+- **CLAUDE.md**: Comprehensive technical reference for Claude Code integration
+  - Architecture overview, component docs, multi-agent guardrails
+  - 3-tier summarizer, auto-recovery, debugging guide
+  - Performance tuning, extension points, filesystem layout
+- **`PROXY_DIR` env variable**: API proxy directory is now configurable (was hardcoded)
+
+### Fixed
+- **Security**: Removed hardcoded personal path in `_recover_proxy()` — now uses `PROXY_DIR` env var with `~/max_api_proxy` default
+- **Security**: Replaced personal project path in `/cron` help example with generic placeholder
+
+### Changed
+- `.gitignore`: Added `.agents.json`, `.cron_jobs.json`, `.whale_state.json` to prevent accidental commit of runtime state files containing personal data
+- `.env.example`: Added `PROXY_DIR` entry
+
 ## v0.4.2 (2026-04-12) — Response Delivery Overhaul
 
 ### Fixed

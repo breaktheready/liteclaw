@@ -6,3 +6,6 @@ __pycache__/
 *.log
 PROMOTION.md
 DEVNOTES.md
+.agents.json
+.cron_jobs.json
+.whale_state.json

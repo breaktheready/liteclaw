@@ -112,6 +112,10 @@ python3 liteclaw.py
 | `INTERMEDIATE_INTERVAL` | `10` | 진행 상황 업데이트 간격 (초) |
 | `STAGING_DIR` | `~/liteclaw-files` | 파일 업로드 디렉토리 |
 | `EXTRA_PROMPT_PATTERNS` | (비어있음) | 커스텀 프롬프트 감지용 정규식 (쉼표 구분) |
+| `PROXY_DIR` | `~/max_api_proxy` | API 프록시 디렉토리 (자동 복구용 `docker compose up -d`) |
+| `DASHBOARD_PORT` | `7777` | 웹 대시보드 포트 (`0`으로 비활성화) |
+| `HISTORY_FILE` | `~/.liteclaw-history.jsonl` | 대화 기록 파일 위치 |
+| `HISTORY_RECALL_LIMIT` | `50` | `/recall` 최대 반환 개수 |
 
 ## 텔레그램 명령어
 
@@ -129,6 +133,27 @@ python3 liteclaw.py
 | `/get FILEPATH` | 서버에서 파일 다운로드 |
 | 파일 전송 | 서버에 업로드 후 Claude에 경로 전달 |
 | 사진 전송 | 사진 저장 후 경로를 Claude에 전달 |
+
+### 멀티 에이전트 명령어
+
+| 명령어 | 설명 |
+|--------|------|
+| `/agents` | 등록된 모든 에이전트 목록 |
+| `/agent new 이름 경로` | 새 Claude Code 에이전트를 전용 tmux 세션에 생성 |
+| `/agent status` | 모든 에이전트 상세 상태 (pane 미리보기 포함) |
+| `/agent remove 이름` | 에이전트 tmux 세션 종료 및 등록 해제 |
+| `/assign 이름 작업` | 에이전트에 작업 전달 후 응답 릴레이 |
+
+### 크론 명령어
+
+| 명령어 | 설명 |
+|--------|------|
+| `/cron list` | 모든 예약 작업 표시 |
+| `/cron add ID CRON(5) 프로젝트 메시지` | 새 크론 작업 생성 (5필드 cron 표현식) |
+| `/cron remove ID` | 작업 삭제 및 스케줄 해제 |
+| `/cron enable/disable ID` | 작업 실행 토글 |
+| `/cron run ID` | 수동 실행 (테스트용) |
+| `/cron log ID` | 마지막 실행 시각 및 상태 확인 |
 
 ### 명령어 상세 설명
 

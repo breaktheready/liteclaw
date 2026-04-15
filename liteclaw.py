@@ -36,10 +36,11 @@ from zoneinfo import ZoneInfo
 
 import httpx
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -250,6 +251,69 @@ _ACTIVITY_PATTERNS = re.compile(
 )
 
 
+def detect_interactive_prompt(content: str) -> dict | None:
+    """Detect if Claude Code is showing an interactive selection prompt.
+    Returns dict with 'question' and 'options' if found, else None.
+
+    Claude Code interactive prompts look like:
+      ? Which option do you prefer?
+      ❯ Option A (selected)
+        Option B
+        Option C
+    Or AskUserQuestion with numbered options:
+      ? Question text
+        1. Option one
+        2. Option two
+    """
+    lines = content.strip().split("\n")
+    if not lines:
+        return None
+
+    # Find question line (starts with ? or contains a question waiting for input)
+    question = None
+    question_idx = -1
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Claude Code question prompt: "? question text"
+        if stripped.startswith("? ") and len(stripped) > 5:
+            question = stripped[2:]
+            question_idx = i
+        # Also match "Select:" or similar
+        elif re.match(r"^(Select|Choose|Pick)\s", stripped, re.IGNORECASE):
+            question = stripped
+            question_idx = i
+
+    if question is None or question_idx < 0:
+        return None
+
+    # Collect options after the question
+    options = []
+    for line in lines[question_idx + 1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Option patterns: "❯ Option" / "  Option" / "1. Option" / "• Option"
+        m = re.match(r"^[❯►>•]\s+(.+)", stripped)
+        if m:
+            options.append(m.group(1).strip())
+            continue
+        m = re.match(r"^\d+[.)]\s+(.+)", stripped)
+        if m:
+            options.append(m.group(1).strip())
+            continue
+        m = re.match(r"^\s{2,}(.+)", line)  # indented = option
+        if m and not _PROMPT_RE.search(stripped) and not _ACTIVITY_PATTERNS.search(stripped):
+            options.append(m.group(1).strip())
+            continue
+        # Stop at prompt or non-option content
+        if _PROMPT_RE.search(stripped):
+            break
+
+    if len(options) >= 2:
+        return {"question": question, "options": options[:10]}  # max 10 options
+    return None
+
+
 def get_pane_cwd(target: str) -> str:
     """Get the current working directory of the tmux pane."""
     r = subprocess.run(
@@ -318,19 +382,25 @@ def format_for_telegram(text: str) -> str:
 # Summarizer
 # =============================================================================
 
-SUMMARIZE_PROMPT = """You are a concise assistant that reformats Claude Code CLI output for Telegram.
+SUMMARIZE_PROMPT = """You are a REFORMATTER. Your ONLY job is to clean up raw terminal output for Telegram.
 
-Rules:
-- Extract the meaningful response, discard terminal noise (tool calls, file reads, status lines, hook messages)
+CRITICAL RULES:
+- You are NOT the assistant that produced this output. Do NOT respond to the user's question.
+- Do NOT say "I can't do X" or "I don't have access to Y" — you are reformatting, not answering.
+- Do NOT add your own opinions, suggestions, or commentary.
+- If the output shows work-in-progress (tool calls, file edits), summarize WHAT WAS DONE, not what you think about it.
+- If the output contains errors from the CLI, report them as-is — do NOT apologize for them.
+- JUST REFORMAT. Nothing else.
+
+Reformatting rules:
+- Extract the meaningful response, discard terminal noise (ANSI codes, hook messages, status bars)
 - Keep code blocks, commands, key decisions, and action items intact
 - Respond in the same language as the user's question
 - If the output contains an error, highlight it clearly
 - Keep it concise but NEVER drop important content — completeness over brevity
-- Do NOT add your own commentary — just reformat what Claude said
 
-Telegram formatting rules (IMPORTANT):
-- NO markdown tables (|---|) — Telegram can't render them. Use bullet points instead:
-  • "항목: 설명" or "항목 → 설명" format
+Telegram formatting rules:
+- NO markdown tables (|---|) — use bullet points: "항목: 설명" or "항목 → 설명"
 - NO # headers — use **bold text** for section titles
 - Use bullet points (•, -, ◦) for lists
 - Use `code` for inline code, triple backticks for code blocks
@@ -607,6 +677,7 @@ class LiteClaw:
         self._cron_jobs: list[dict] = []
         self._cron_file = Path(__file__).resolve().parent / ".cron_jobs.json"
         self._cron_running: set[str] = set()  # job ids currently executing
+        self._interactive_sent = False  # prevent duplicate interactive prompts
         self._load_cron_jobs()
 
     def _load_agents(self):
@@ -2058,6 +2129,7 @@ class LiteClaw:
 
         t0 = time.monotonic()
         self.busy = True
+        self._interactive_sent = False  # reset for new message
         self._last_activity = datetime.now().isoformat()
         log.info(f"Received: {user_text[:80]}...")
 
@@ -2422,6 +2494,61 @@ class LiteClaw:
         log.warning("Background delivery timeout (30min)")
         self.busy = False
 
+    async def _send_interactive_prompt(self, bot, interactive: dict):
+        """Send Claude's interactive prompt as Telegram inline keyboard."""
+        question = interactive["question"]
+        options = interactive["options"]
+
+        # Build inline keyboard — one button per row
+        keyboard = []
+        for i, opt in enumerate(options):
+            label = opt[:60]  # Telegram button limit
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"pick:{i}:{opt[:40]}")])
+
+        markup = InlineKeyboardMarkup(keyboard)
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=f"❓ Claude is asking:\n\n**{question}**\n\nTap to select:",
+                reply_markup=markup,
+                parse_mode="Markdown",
+            )
+            log.info(f"Interactive prompt sent: {question} ({len(options)} options)")
+        except Exception as e:
+            log.warning(f"Failed to send interactive prompt: {e}")
+            # Fallback: send as plain text with numbered options
+            lines = [f"❓ Claude is asking:\n\n{question}\n"]
+            for i, opt in enumerate(options, 1):
+                lines.append(f"  {i}. {opt}")
+            lines.append("\nReply with the number to select.")
+            await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines))
+
+    async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Handle inline keyboard button presses for interactive prompts."""
+        query = update.callback_query
+        if not query or not query.data.startswith("pick:"):
+            return
+        await query.answer()
+
+        parts = query.data.split(":", 2)
+        if len(parts) < 3:
+            return
+        idx = int(parts[1])
+        label = parts[2]
+
+        # Send arrow keys to select the option, then Enter
+        # Claude Code uses arrow keys to navigate: first option is already selected (index 0)
+        # We need to press Down `idx` times, then Enter
+        target = self.target
+        for _ in range(idx):
+            subprocess.run(["tmux", "send-keys", "-t", target, "Down"], capture_output=True)
+            await asyncio.sleep(0.1)
+        send_enter(target)
+
+        self._interactive_sent = False  # reset for next prompt
+        await query.edit_message_text(f"✅ Selected: {label}")
+        log.info(f"Interactive selection: index={idx} label={label}")
+
     async def _poll_response(self, bot, user_text: str = "", pre_snapshot: str = "") -> str:
         """Poll until response stabilizes. Uses pipe-pane log for output, capture-pane for prompt detection."""
         prev_content = ""
@@ -2463,6 +2590,13 @@ class LiteClaw:
                 prompt_count += 1
             else:
                 prompt_count = 0
+
+            # Interactive prompt detection: stable + no activity + not idle = waiting for input
+            if stable_count >= 3 and not _ACTIVITY_PATTERNS.search(pane_content) and not is_idle_prompt(pane_content):
+                interactive = detect_interactive_prompt(pane_content)
+                if interactive and not getattr(self, '_interactive_sent', False):
+                    self._interactive_sent = True
+                    await self._send_interactive_prompt(bot, interactive)
 
             # Status update at adaptive interval — show last few meaningful lines
             if elapsed - last_status >= status_interval:
@@ -2774,10 +2908,11 @@ class LiteClaw:
 
         # Build the prompt for Claude Code
         prompt = (
-            f"Summarize this Claude Code output for a Telegram message. "
-            f"Be concise, keep code blocks, use the same language as the question. "
-            f"User asked: {user_question[:200]}\n\n"
-            f"Output:\n{raw_output[:4000]}"
+            f"REFORMAT TASK: Clean up this terminal output for Telegram. "
+            f"Do NOT answer the question yourself — just reformat what the other Claude said. "
+            f"Keep code blocks, use the same language, be concise. "
+            f"Context — user asked: {user_question[:200]}\n\n"
+            f"Terminal output to reformat:\n{raw_output[:4000]}"
         )
 
         try:
@@ -2861,8 +2996,10 @@ class LiteClaw:
             "messages": [
                 {"role": "system", "content": SUMMARIZE_PROMPT},
                 {"role": "user", "content": (
-                    f"User's question:\n{user_question}\n\n"
-                    f"Raw Claude Code output:\n```\n{raw_output[:12000]}\n```"
+                    f"[REFORMAT TASK] Clean up the following terminal output for Telegram delivery.\n"
+                    f"Context — the user asked: \"{user_question}\"\n\n"
+                    f"Raw terminal output to reformat:\n```\n{raw_output[:12000]}\n```\n\n"
+                    f"Remember: ONLY reformat. Do NOT answer the user's question yourself."
                 )},
             ],
             "max_tokens": 4000,
@@ -2983,6 +3120,7 @@ class LiteClaw:
         app.add_handler(CommandHandler("agent", self.cmd_agent))
         app.add_handler(CommandHandler("assign", self.cmd_assign))
         app.add_handler(CommandHandler("cron", self.cmd_cron))
+        app.add_handler(CallbackQueryHandler(self._handle_callback))
         app.add_handler(CommandHandler("evolve", self.cmd_evolve))
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))

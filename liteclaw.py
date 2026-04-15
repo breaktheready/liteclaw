@@ -18,6 +18,7 @@ Usage:
 """
 
 import asyncio
+import hashlib
 import html
 import json as _json
 import logging
@@ -679,6 +680,8 @@ class LiteClaw:
         self._cron_running: set[str] = set()  # job ids currently executing
         self._interactive_sent = False  # prevent duplicate interactive prompts
         self._load_cron_jobs()
+        # Session recovery state file
+        self._state_file = Path(__file__).resolve().parent / ".liteclaw_state.json"
 
     def _load_agents(self):
         """Load agent registry from .agents.json."""
@@ -706,6 +709,94 @@ class LiteClaw:
             self._agents_file.write_text(_json.dumps(self._agents, indent=2))
         except Exception as e:
             log.warning(f"Failed to save agents file: {e}")
+
+    def _save_state(self):
+        """Save pane snapshot hash for session recovery."""
+        try:
+            pane = capture_pane(self.target, lines=SCROLLBACK_LINES)
+            state = {
+                "last_pane_hash": hashlib.md5(pane.encode()).hexdigest(),
+                "last_pane_tail": pane.strip().split("\n")[-20:],  # last 20 lines
+                "timestamp": datetime.now().isoformat(),
+                "target": self.target,
+            }
+            self._state_file.write_text(_json.dumps(state, indent=2, ensure_ascii=False))
+        except Exception as e:
+            log.warning(f"Failed to save state: {e}")
+
+    async def _recover_pending_messages(self, bot):
+        """Check if Claude responded after LiteClaw's last shutdown and deliver missed messages."""
+        if not self._state_file.exists():
+            log.info("No previous state — skipping session recovery")
+            return
+
+        try:
+            state = _json.loads(self._state_file.read_text())
+        except Exception:
+            return
+
+        saved_target = state.get("target", "")
+        if saved_target != self.target:
+            log.info(f"Target changed ({saved_target} → {self.target}), skipping recovery")
+            return
+
+        saved_hash = state.get("last_pane_hash", "")
+        saved_tail = state.get("last_pane_tail", [])
+
+        try:
+            current_pane = capture_pane(self.target, lines=SCROLLBACK_LINES)
+        except RuntimeError:
+            return
+
+        current_hash = hashlib.md5(current_pane.encode()).hexdigest()
+        if current_hash == saved_hash:
+            log.info("Pane unchanged since last session — no recovery needed")
+            return
+
+        # Find new content by diffing against saved tail
+        current_lines = current_pane.strip().split("\n")
+        saved_tail_str = "\n".join(saved_tail).strip()
+
+        # Find where saved tail ends in current pane
+        new_content = ""
+        for i in range(len(current_lines)):
+            window = "\n".join(current_lines[i:i+len(saved_tail)]).strip()
+            if window == saved_tail_str:
+                # Everything after this match is new
+                remaining = current_lines[i+len(saved_tail):]
+                new_content = clean_output("\n".join(remaining)).strip()
+                break
+
+        if not new_content or len(new_content) < 30:
+            log.info("No significant new content since last session")
+            return
+
+        # Check if it's just a prompt (no actual response)
+        if all(line.strip() == "" or "❯" in line for line in new_content.split("\n")):
+            return
+
+        log.info(f"Session recovery: found {len(new_content)} chars of undelivered content")
+
+        # Summarize and deliver
+        try:
+            if self._api_available and len(new_content) > 50:
+                summary = await asyncio.wait_for(
+                    self._summarize("(session recovery)", new_content),
+                    timeout=30.0,
+                )
+                new_content = summary
+        except Exception:
+            pass  # deliver raw if summarize fails
+
+        header = "📋 이전 세션 미전달 메시지:\n\n"
+        for chunk in split_message(header + new_content):
+            try:
+                await bot.send_message(chat_id=CHAT_ID, text=chunk)
+            except Exception as e:
+                log.warning(f"Recovery delivery failed: {e}")
+
+        self._save_state()
+        log.info("Session recovery complete")
 
     def _load_skills(self):
         """Load approved skill files from ~/.liteclaw-evolve/skills/"""
@@ -2280,6 +2371,7 @@ class LiteClaw:
         if meta is not None:
             meta["sum_len"] = len(response)
         self._log_conversation(user_text, response, summarized=not self.raw_mode, meta=meta)
+        self._save_state()
         return last_msg_id
 
     async def _followup_edit(self, user_text: str, pre_snapshot: str, msg_id: int, bot):
@@ -2487,6 +2579,7 @@ class LiteClaw:
                                     json={"chat_id": CHAT_ID, "text": chunk},
                                 )
                     log.info(f"Background delivery complete: {len(response)} chars")
+                    self._save_state()
                 self.busy = False
                 return
             except Exception as e:
@@ -3092,6 +3185,8 @@ class LiteClaw:
                 name="evolve-proposal-check",
             )
             log.info("Evolve proposal checker scheduled (every 30 min)")
+            # Session recovery: deliver any missed messages from previous session
+            await self._recover_pending_messages(app.bot)
 
         app = (
             Application.builder()

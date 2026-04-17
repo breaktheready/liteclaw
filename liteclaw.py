@@ -1006,10 +1006,13 @@ class LiteClaw:
         self._unregister_skill_handlers()
 
         self._skills = {}
+        _SKILL_SKIP_NAMES = {"README.md", "README_KO.md", "README.ko.md"}
         for skill_file in sorted(SKILLS_PATH.iterdir()):
             if skill_file.name.startswith("_") or skill_file.name.startswith("."):
                 continue
             if not skill_file.is_file():
+                continue
+            if skill_file.name in _SKILL_SKIP_NAMES:
                 continue
             if skill_file.suffix == ".py":
                 self._load_skill_py(skill_file)

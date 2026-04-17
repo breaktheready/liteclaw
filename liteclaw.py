@@ -1516,10 +1516,28 @@ class LiteClaw:
                     continue  # too trivial
                 if self._bot_ref is None:
                     continue
+                # Summarize via 3-tier fallback (same as normal responses)
+                # unless raw_mode is on, in which case forward as-is.
+                summary = new_content
+                if not self.raw_mode and len(new_content) > 100:
+                    try:
+                        summary = await asyncio.wait_for(
+                            self._summarize("(CLI direct input — summarize what the user did and Claude's response)", new_content),
+                            timeout=45,
+                        )
+                    except asyncio.TimeoutError:
+                        log.warning("Mirror summarizer timeout, falling back to raw")
+                        summary = new_content
+                    except Exception as e:
+                        log.warning(f"Mirror summarizer failed: {e}")
+                        summary = new_content
+                # Apply Telegram size limit (summary shouldn't be massive, but guard)
+                if len(summary) > 3800:
+                    summary = summary[:3800] + "\n\n…(truncated)"
                 try:
                     await self._bot_ref.send_message(
                         chat_id=CHAT_ID,
-                        text=f"🔁 CLI mirror\n\n{new_content[:3500]}",
+                        text=f"🔁 CLI mirror\n\n{summary}",
                     )
                 except Exception as e:
                     log.warning(f"Mirror send failed: {e}")

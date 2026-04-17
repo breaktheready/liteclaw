@@ -1475,6 +1475,9 @@ class LiteClaw:
         own echo is not mirrored back).
         """
         log.info("Mirror loop running")
+        # Track last idle state — only mirror when Claude transitions to idle
+        # and content has genuinely changed. Prevents spam during spinner updates.
+        last_idle_hash = ""
         try:
             while self.mirror_on:
                 await asyncio.sleep(MIRROR_POLL_INTERVAL)
@@ -1489,18 +1492,24 @@ class LiteClaw:
                 except Exception as e:
                     log.debug(f"Mirror capture failed: {e}")
                     continue
+                # Only mirror when Claude is idle (prompt visible, no spinner).
+                # Skips the storm of spinner/timer updates during processing.
+                if not is_idle_prompt(capture):
+                    continue
                 cleaned = clean_output(capture).strip()
                 if not cleaned:
                     continue
-                # Use last 10 non-empty lines as "recent activity" window
-                recent_lines = [l for l in cleaned.split("\n") if l.strip()][-10:]
+                # Hash based on last 15 non-empty lines — stable in idle state
+                recent_lines = [l for l in cleaned.split("\n") if l.strip()][-15:]
                 recent = "\n".join(recent_lines)
-                h = hashlib.md5(recent.encode()).hexdigest()
-                if h == self._last_mirror_hash:
+                idle_h = hashlib.md5(recent.encode()).hexdigest()
+                # Only fire on NEW idle state (content changed since last idle)
+                if idle_h == last_idle_hash:
                     continue
                 new_content = self._mirror_diff(self._last_mirror_capture, cleaned)
                 self._last_mirror_capture = cleaned
-                self._last_mirror_hash = h
+                last_idle_hash = idle_h
+                self._last_mirror_hash = idle_h
                 if not new_content or not new_content.strip():
                     continue
                 if len(new_content) < 5:

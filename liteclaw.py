@@ -240,14 +240,18 @@ def is_idle_prompt(content: str) -> bool:
 
 
 # Patterns that indicate Claude Code is still working (tool calls in progress)
-# Covers all 19 known Claude Code CLI activity labels
+# Known Claude Code CLI activity labels (explicit list for documentation)
 _ACTIVITY_LABELS = (
     "Doing|Reading|Running|Writing|Searching|Editing|Thinking|Calling|Executing"
     "|Computing|Channelling|Nesting|Brewing|Recalling|Initializing"
     "|Misting|Expanding|Parsing|Crafting|Focusing|Wondering|Pondering"
+    "|Transfiguring"
 )
+# Primary: spinner char + any word = activity (future-proof against new labels)
+# Fallback: explicit label list kept for documentation/reference
+_SPINNER_CHARS = r"[✻✶✽✢·●*◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
 _ACTIVITY_PATTERNS = re.compile(
-    rf"[✻✶✽✢·●*◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*(?:{_ACTIVITY_LABELS})"
+    rf"{_SPINNER_CHARS}\s*[A-Z][a-z]{{2,}}"   # spinner + capitalized word (e.g. ✢ Transfiguring)
     r"|\(thinking\)"
 )
 
@@ -2685,7 +2689,8 @@ class LiteClaw:
                 prompt_count = 0
 
             # Interactive prompt detection: stable + no activity + not idle = waiting for input
-            if stable_count >= 3 and not _ACTIVITY_PATTERNS.search(pane_content) and not is_idle_prompt(pane_content):
+            _recent = "\n".join(pane_content.strip().split("\n")[-10:])
+            if stable_count >= 3 and not _ACTIVITY_PATTERNS.search(_recent) and not is_idle_prompt(pane_content):
                 interactive = detect_interactive_prompt(pane_content)
                 if interactive and not getattr(self, '_interactive_sent', False):
                     self._interactive_sent = True

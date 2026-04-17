@@ -172,6 +172,25 @@ NOISE_PATTERNS = [
 _NOISE_RE = re.compile("|".join(f"(?:{p})" for p in NOISE_PATTERNS))
 
 
+def _normalize_for_mirror_hash(text: str) -> str:
+    """Strip volatile elements so hash is stable across TUI re-renders.
+    Removes: timers (8m 49s), token counters (↑ 4.8k tokens), ctx %, numeric
+    sequences in progress lines, and collapses whitespace."""
+    # Timer patterns: "8m 49s", "1h 23m", "123s"
+    text = re.sub(r"\b\d+[hms]\b\s*\d*[hms]?", "", text)
+    # Token counters: "↑ 4.8k tokens", "↑ 123 tokens", "123k tokens"
+    text = re.sub(r"[↑↓]\s*[\d.]+k?\s*tokens?", "", text, flags=re.IGNORECASE)
+    # Context %: "12% context left", "context: 34%"
+    text = re.sub(r"\d+%\s*(context|ctx)", "", text, flags=re.IGNORECASE)
+    # Spinner chars at line start (already variant but double-safe)
+    text = re.sub(r"^\s*[✻✶✽✢·●*◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*", "", text, flags=re.MULTILINE)
+    # Any trailing numeric parentheses: "(8s)", "(1.2MB)"
+    text = re.sub(r"\(\s*[\d.]+\s*\w*\s*\)", "", text)
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
 def clean_output(text: str) -> str:
     """Strip ANSI escapes, OSC sequences, status bar, and Claude Code TUI noise."""
     text = ANSI_RE.sub("", text)
@@ -1477,7 +1496,7 @@ class LiteClaw:
         log.info("Mirror loop running")
         # Track last idle state — only mirror when Claude transitions to idle
         # and content has genuinely changed. Prevents spam during spinner updates.
-        last_idle_hash = ""
+        # Persist across restarts via self._last_mirror_hash (loaded from state).
         try:
             while self.mirror_on:
                 await asyncio.sleep(MIRROR_POLL_INTERVAL)
@@ -1493,22 +1512,37 @@ class LiteClaw:
                     log.debug(f"Mirror capture failed: {e}")
                     continue
                 # Only mirror when Claude is idle (prompt visible, no spinner).
-                # Skips the storm of spinner/timer updates during processing.
                 if not is_idle_prompt(capture):
                     continue
                 cleaned = clean_output(capture).strip()
                 if not cleaned:
                     continue
-                # Hash based on last 15 non-empty lines — stable in idle state
+                # Normalize content for STABLE hashing (strip timers/token counts/
+                # cursor positions etc. that change even when "idle")
                 recent_lines = [l for l in cleaned.split("\n") if l.strip()][-15:]
                 recent = "\n".join(recent_lines)
-                idle_h = hashlib.md5(recent.encode()).hexdigest()
+                normalized = _normalize_for_mirror_hash(recent)
+                idle_h = hashlib.md5(normalized.encode()).hexdigest()
                 # Only fire on NEW idle state (content changed since last idle)
-                if idle_h == last_idle_hash:
+                if idle_h == self._last_mirror_hash:
                     continue
+                # Require stability: confirm hash is same after short re-check
+                # (prevents firing on transient idle->edit->idle oscillations)
+                await asyncio.sleep(1.5)
+                try:
+                    recheck = capture_pane(self.target, lines=40)
+                except Exception:
+                    continue
+                if not is_idle_prompt(recheck):
+                    continue
+                cleaned2 = clean_output(recheck).strip()
+                recent_lines2 = [l for l in cleaned2.split("\n") if l.strip()][-15:]
+                normalized2 = _normalize_for_mirror_hash("\n".join(recent_lines2))
+                idle_h2 = hashlib.md5(normalized2.encode()).hexdigest()
+                if idle_h2 != idle_h:
+                    continue  # still changing, not truly stable
                 new_content = self._mirror_diff(self._last_mirror_capture, cleaned)
                 self._last_mirror_capture = cleaned
-                last_idle_hash = idle_h
                 self._last_mirror_hash = idle_h
                 if not new_content or not new_content.strip():
                     continue

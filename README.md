@@ -36,6 +36,11 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
 - **File transfer** — Send files to the server and download results back to Telegram
 - **Multi-target** — Switch between tmux sessions and windows on the fly
 - **Photo upload** — Send photos for Claude's vision tasks
+- **CLI Mirror** (`/mirror`) — Forward terminal direct-typed input to Telegram with debounce (off by default for security)
+- **Draft Streaming** — Status messages edit in place, converging into a single final answer
+- **Reasoning Lane** (`/reasoning`) — Claude's `(thinking)` blocks separated into a clean preface, final answer stays readable
+- **Smart Interactive Prompts** — Yes/No prompts auto-generate Telegram inline keyboards; free-form answers (e.g. "the second one") auto-parse to option index
+- **Skill System** — Extensible skills in Markdown or Python at `~/.liteclaw/skills/`. Register via `/lcskill`. Appear natively in Telegram command menu.
 - **Multi-agent orchestration** — LiteClaw acts as org lead, spinning up independent peer agents in separate tmux sessions. New commands: `/agents`, `/agent new|status|remove`, `/assign`. Agent registry persists across restarts.
 - **Auto-recovery** — Detects and recovers from API proxy downtime automatically. Re-authenticates Claude Code sessions on 401 errors and notifies you via Telegram when back online.
 - **Unified notifications** — All Telegram messages route through a single `notify.py` module with summarizer cleanup. Falls back to raw output if the summarizer is unavailable.
@@ -142,8 +147,19 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 | `/model MODEL_NAME` | Change the summarizer model (e.g. `/model claude-sonnet-4-6`) |
 | `/sessions` | List all active tmux sessions |
 | `/get FILEPATH` | Download a file from the server to Telegram |
+| `/mirror on\|off\|status` | Enable/disable CLI Mirror (forward typed input to Telegram with debounce) |
+| `/reasoning on\|off\|status` | Enable/disable Reasoning Lane (separate `(thinking)` blocks into preface) |
 | Send a document | Upload a file to `STAGING_DIR` and relay its path (and contents for small files) to Claude |
 | Send a photo | Upload a photo to `STAGING_DIR` and relay the path to Claude for vision tasks |
+
+### Skill Commands
+
+| Command | Description |
+|---------|-------------|
+| `/lcskill list` | Show all available skills |
+| `/lcskill new NAME` | Create a new skill template (Markdown) |
+| `/lcskill remove NAME` | Delete and unregister a skill |
+| `/lcskill reload` | Reload all skills from disk |
 
 ### Multi-Agent Commands
 
@@ -185,6 +201,98 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 **`/sessions`** — Runs `tmux list-sessions` and sends the output. Helps when you need to find the right session name for `/target`.
 
 **`/get`** — Downloads a file from the server. Relative paths are resolved from the tmux pane's working directory. Absolute paths work as-is. Maximum 50 MB.
+
+---
+
+## Skills
+
+LiteClaw supports extensible skills stored in `~/.liteclaw/skills/`. Skills can be written in **Markdown** (with YAML frontmatter) or **Python**.
+
+### Markdown Skills
+
+Markdown skills use a template syntax with YAML frontmatter:
+
+```markdown
+---
+name: translate
+description: Translate text to another language
+---
+
+Translate the following text to {{language}}:
+
+{{text}}
+```
+
+**Placeholders** (`{{varname}}`) are replaced by arguments passed via Telegram. For example:
+
+```
+/translate language=Korean text=Hello world
+```
+
+This injects the prompt into Claude's session with values substituted.
+
+### Python Skills
+
+Python skills are executable modules with a standard interface:
+
+```python
+# my_skill.py
+COMMAND = "my_skill"
+DESCRIPTION = "Does something useful"
+
+async def handler(args: dict, context: LiteClawContext) -> str:
+    """Handler function. args contains parsed arguments."""
+    result = await context.send_to_claude(f"Do work with {args.get('param')}")
+    return result
+```
+
+Skill functions are executed in-context with access to LiteClaw's state.
+
+### Skill Management
+
+**Create a new skill** (Markdown template):
+
+```
+/lcskill new my_skill
+```
+
+This creates `~/.liteclaw/skills/my_skill.md` with a template. Edit and save — it's automatically reloaded within ~10s.
+
+**List available skills**:
+
+```
+/lcskill list
+```
+
+Shows all registered skills and maps them to Telegram `/skillname` commands.
+
+**Reload skills**:
+
+```
+/lcskill reload
+```
+
+Manually refresh all skills from disk (automatic hot-reload also runs every 10s).
+
+**Remove a skill**:
+
+```
+/lcskill remove skill_name
+```
+
+Deletes the skill and unregisters from Telegram command menu.
+
+### Telegram Command Menu
+
+All registered skills appear natively in Telegram's command menu (the `/` autocomplete). LiteClaw periodically re-registers the menu to prevent pollution from other Telegram bridges (e.g. OpenClaw).
+
+### Storage & Persistence
+
+Skills are stored in `~/.liteclaw/skills/`:
+- **Markdown**: `skill_name.md` with frontmatter
+- **Python**: `skill_name.py` with COMMAND/DESCRIPTION/handler
+
+Automatic migration from legacy `~/.liteclaw-evolve/skills/` on startup.
 
 ---
 

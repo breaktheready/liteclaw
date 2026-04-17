@@ -34,6 +34,11 @@ Claude API를 직접 호출하는 도구들과 달리 (= 추가 비용), LiteCla
 - **파일 전송** — 텔레그램으로 파일 송수신
 - **멀티 타겟** — 여러 tmux 세션 간 전환 가능
 - **사진 전송** — 비전 작업을 위한 이미지 업로드 지원
+- **CLI 미러** (`/mirror`) — 터미널에 직접 입력한 내용을 디바운싱하며 텔레그램으로 전달 (기본값: OFF, 보안)
+- **드래프트 스트리밍** — 상태 메시지가 제자리에서 편집되면서 최종 답변으로 수렴 (delete+resend 대신 단일 메시지 유지)
+- **추론 레인** (`/reasoning`) — Claude의 `(thinking)` 블록을 별도 프리페이스로 분리, 최종 답변은 깔끔하게 유지
+- **스마트 상호작용 프롬프트** — Yes/No 프롬프트가 텔레그램 인라인 키보드 자동 생성; 자유형 답변("두 번째", "the second one") 자동 파싱
+- **스킬 시스템** — `~/.liteclaw/skills/`에 Markdown/Python 스킬 등록. `/lcskill`로 관리. 텔레그램 명령어 메뉴에 네이티브 표시.
 - **멀티 에이전트 오케스트레이션** — LiteClaw이 org lead 역할로 독립적인 peer 에이전트들을 별도 tmux 세션에서 관리합니다. 새 명령어: `/agents`, `/agent new|status|remove`, `/assign`. 에이전트 레지스트리는 재시작 후에도 유지됩니다.
 - **자동 복구** — API 프록시 다운타임을 자동 감지하고 복구합니다. 401 에러 시 Claude Code 세션을 자동 재인증하고, 복구 완료 시 텔레그램으로 알림을 보냅니다.
 - **통합 알림** — 모든 텔레그램 알림이 단일 `notify.py` 모듈을 통해 요약기를 거쳐 전달됩니다. 요약기를 사용할 수 없는 경우 원본 출력으로 자동 전환됩니다.
@@ -135,8 +140,19 @@ python3 liteclaw.py
 | `/raw` | 원본/요약 모드 전환 |
 | `/model MODEL` | 요약 모델 변경 |
 | `/get FILEPATH` | 서버에서 파일 다운로드 |
+| `/mirror on\|off\|status` | CLI 미러 활성화/비활성화 (직접 입력 터미널 포워딩) |
+| `/reasoning on\|off\|status` | 추론 레인 활성화/비활성화 (`(thinking)` 블록 분리) |
 | 파일 전송 | 서버에 업로드 후 Claude에 경로 전달 |
 | 사진 전송 | 사진 저장 후 경로를 Claude에 전달 |
+
+### 스킬 명령어
+
+| 명령어 | 설명 |
+|--------|------|
+| `/lcskill list` | 등록된 모든 스킬 목록 |
+| `/lcskill new 스킬이름` | 새 스킬 템플릿 생성 (Markdown) |
+| `/lcskill remove 스킬이름` | 스킬 삭제 및 등록 해제 |
+| `/lcskill reload` | 디스크에서 모든 스킬 다시 로드 |
 
 ### 멀티 에이전트 명령어
 
@@ -276,6 +292,98 @@ LiteClaw은 3단계 요약기를 내장하고 있어 추가 설정 없이 바로
 **Tier 3: 원본 출력** — 두 단계 모두 실패하면 응답을 그대로 전달합니다. `/raw`로 강제 전환도 가능.
 
 시작 시 LiteClaw이 API 엔드포인트를 자동 확인하고, 연결 불가하면 Tier 2를 미리 준비합니다.
+
+## 스킬 시스템
+
+LiteClaw은 `~/.liteclaw/skills/`에 저장된 확장 가능한 스킬을 지원합니다. 스킬은 **Markdown** (YAML 프론트매터 포함) 또는 **Python**으로 작성할 수 있습니다.
+
+### Markdown 스킬
+
+Markdown 스킬은 YAML 프론트매터를 사용하는 템플릿 문법입니다:
+
+```markdown
+---
+name: translate
+description: 다른 언어로 텍스트 번역
+---
+
+다음 텍스트를 {{language}}으로 번역하세요:
+
+{{text}}
+```
+
+**플레이스홀더** (`{{varname}}`)는 텔레그램을 통해 전달되는 인수로 치환됩니다. 예를 들어:
+
+```
+/translate language=영어 text=안녕하세요
+```
+
+프롬프트가 Claude 세션에 주입되고 값으로 치환됩니다.
+
+### Python 스킬
+
+Python 스킬은 표준 인터페이스를 가진 실행 가능한 모듈입니다:
+
+```python
+# my_skill.py
+COMMAND = "my_skill"
+DESCRIPTION = "유용한 작업 수행"
+
+async def handler(args: dict, context: LiteClawContext) -> str:
+    """핸들러 함수. args는 파싱된 인수를 포함합니다."""
+    result = await context.send_to_claude(f"작업 수행: {args.get('param')}")
+    return result
+```
+
+스킬 함수는 LiteClaw의 상태에 접근할 수 있는 컨텍스트에서 실행됩니다.
+
+### 스킬 관리
+
+**새 스킬 생성** (Markdown 템플릿):
+
+```
+/lcskill new my_skill
+```
+
+`~/.liteclaw/skills/my_skill.md`를 템플릿과 함께 생성합니다. 편집 후 저장하면 약 10초 내에 자동 다시 로드됩니다.
+
+**스킬 목록 표시**:
+
+```
+/lcskill list
+```
+
+모든 등록된 스킬과 텔레그램 `/skillname` 명령어 매핑을 표시합니다.
+
+**스킬 다시 로드**:
+
+```
+/lcskill reload
+```
+
+디스크에서 모든 스킬을 수동으로 새로 고칩니다 (자동 핫-리로드도 10초마다 실행).
+
+**스킬 제거**:
+
+```
+/lcskill remove skill_name
+```
+
+스킬을 삭제하고 텔레그램 명령어 메뉴에서 등록 해제합니다.
+
+### 텔레그램 명령어 메뉴
+
+모든 등록된 스킬은 텔레그램의 명령어 메뉴(자동완성 `/` 버튼)에 네이티브로 나타납니다. LiteClaw은 주기적으로 메뉴를 다시 등록하여 다른 텔레그램 봇(예: OpenClaw)의 오염을 방지합니다.
+
+### 저장 및 지속성
+
+스킬은 `~/.liteclaw/skills/`에 저장됩니다:
+- **Markdown**: 프론트매터를 포함한 `skill_name.md`
+- **Python**: COMMAND/DESCRIPTION/핸들러를 포함한 `skill_name.py`
+
+시작 시 레거시 `~/.liteclaw-evolve/skills/`에서 자동 마이그레이션됩니다.
+
+---
 
 ## 봇 토큰 받기
 

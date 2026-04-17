@@ -1,5 +1,35 @@
 # Changelog
 
+## v0.5.0 (2026-04-17) — CLI Mirror, Draft Streaming, Reasoning Lane & Skill System
+
+### Added
+- **CLI Mirror** (`/mirror on|off|status`) — Forward terminal direct-typed input to Telegram with 10s debounce. Off by default (security). New env vars `MIRROR_ENABLED`, `MIRROR_DEBOUNCE`, `MIRROR_POLL_INTERVAL`
+- **Draft Streaming** — Status message edits in place, converging into the final answer (single consolidated Telegram message instead of delete+resend). Env vars `DRAFT_STREAM_ENABLED` (default true), `DRAFT_STREAM_INTERVAL` (default 4s). Hash-gated edits, 1 edit/sec rate limit, 429-aware backoff
+- **Reasoning Lane** (`/reasoning on|off|status`) — Claude's `(thinking)` blocks separated into a 🧠 preface message; final answer is cleaner. Env vars `REASONING_LANE_ENABLED` (default true), `REASONING_PREFIX`
+- **Smart Y/N prompts** — `[Y/n]`, `[y/N]`, `Do you want to proceed` auto-produces Telegram inline keyboard with default option highlighted. Env var `INTERACTIVE_AUTO_YN`
+- **Free-form answer parser** — Reply "첫번째", "the second one", "2번" etc. and Sonnet interprets it into correct option index. Env var `INTERACTIVE_FREEFORM`
+- **`_click_option()` improvement** — Verified Down-key navigation with `DOWN_KEY_DELAY=0.35s` (was 0.1s racy)
+- **LiteClaw skill system** — `~/.liteclaw/skills/` supports both Python (.py) and Markdown (.md) skills
+- **Markdown skills** — YAML frontmatter + prompt template, `{{args}}` substitution, injected into Claude session
+- **Skill management** (`/lcskill list | reload | new <name> | remove <name>`) — Create, manage, and reload skills
+- **Telegram native command menu** — `setMyCommands()` registers liteclaw skills natively, overriding pollution from other Telegram bridges (e.g. OpenClaw). Periodic re-registration every 10 min to resist being overridden
+- **Hot-reload** — Skill directory changes picked up within ~10s (gated by `SKILLS_HOT_RELOAD`)
+- **Config persistence** — Runtime toggles (mirror/reasoning/draft/raw) at `~/.liteclaw/config.json` survive restarts
+- **Automatic migration** — `~/.liteclaw-evolve/skills/` → `~/.liteclaw/skills/`
+- **`_edit_with_retry()` helper** — 3x backoff, "not modified" tolerance, 429-aware
+
+### Fixed
+- **Down-key race** — Pane verified between presses, no more silent navigation failures
+- **Index 0 bug** — Pre-selected first option no longer sends bogus Down key
+- **Callback failures** — Now surface explicit Telegram error + text-fallback guidance (was silent)
+- **OpenClaw skill pollution** — Native command menu now registers only liteclaw skills (see Added)
+- **Telegram edit failures** — No longer silently lost; 3x retry chain ensures delivery
+
+### Changed
+- **Status message lifecycle** — Edit-in-place instead of delete+resend (short answers stay in single conversation bubble)
+- **Polling interval semantics** — Draft streaming 3-15s vs legacy 10-60s
+- **Legacy skill path** — `~/.liteclaw-evolve/skills/` deprecated (auto-migrated)
+
 ## v0.4.3 (2026-04-14) — CLAUDE.md, Auth Heartbeat & Security Hardening
 
 ### Added

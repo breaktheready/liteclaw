@@ -87,6 +87,32 @@ STAGING_DIR = Path(os.environ.get("STAGING_DIR", os.path.expanduser("~/liteclaw-
 HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", os.path.expanduser("~/.liteclaw-history.jsonl")))
 HISTORY_RECALL_LIMIT = int(os.environ.get("HISTORY_RECALL_LIMIT", "50"))  # max entries for /recall
 
+# v0.5.0 UX Overhaul — OpenClaw/Hermes-inspired
+# F1 CLI Mirror
+MIRROR_ENABLED = os.environ.get("MIRROR_ENABLED", "false").lower() == "true"
+MIRROR_DEBOUNCE = float(os.environ.get("MIRROR_DEBOUNCE", "10"))
+MIRROR_POLL_INTERVAL = float(os.environ.get("MIRROR_POLL_INTERVAL", "3"))
+
+# F2 Draft Streaming
+DRAFT_STREAM_ENABLED = os.environ.get("DRAFT_STREAM_ENABLED", "true").lower() == "true"
+DRAFT_STREAM_INTERVAL = float(os.environ.get("DRAFT_STREAM_INTERVAL", "4"))
+
+# F3 Reasoning Lane
+REASONING_LANE_ENABLED = os.environ.get("REASONING_LANE_ENABLED", "true").lower() == "true"
+REASONING_PREFIX = os.environ.get("REASONING_PREFIX", "🧠")
+
+# F4 Interactive prompts
+INTERACTIVE_AUTO_YN = os.environ.get("INTERACTIVE_AUTO_YN", "true").lower() == "true"
+INTERACTIVE_FREEFORM = os.environ.get("INTERACTIVE_FREEFORM", "true").lower() == "true"
+DOWN_KEY_DELAY = float(os.environ.get("DOWN_KEY_DELAY", "0.35"))
+
+# F6 Skills
+LITECLAW_HOME = Path(os.environ.get("LITECLAW_HOME", os.path.expanduser("~/.liteclaw")))
+SKILLS_PATH = Path(os.environ.get("SKILLS_PATH", str(LITECLAW_HOME / "skills")))
+SKILLS_HOT_RELOAD = os.environ.get("SKILLS_HOT_RELOAD", "true").lower() == "true"
+SKILLS_NATIVE_MENU = os.environ.get("SKILLS_NATIVE_MENU", "true").lower() == "true"
+CONFIG_PATH = LITECLAW_HOME / "config.json"
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -317,6 +343,70 @@ def detect_interactive_prompt(content: str) -> dict | None:
     if len(options) >= 2:
         return {"question": question, "options": options[:10]}  # max 10 options
     return None
+
+
+def _detect_yn_prompt(content: str) -> str | None:
+    """Detect Y/N style confirmation prompts.
+    Returns:
+      "Y" if [Y/n] (default Yes),
+      "N" if [y/N] (default No),
+      "?" if "Do you want to proceed",
+      None otherwise.
+    Only looks at the last 10 non-empty lines to avoid stale prompts.
+    """
+    lines = [l for l in content.strip().split("\n") if l.strip()][-10:]
+    joined = "\n".join(lines)
+    if re.search(r"\[Y/n\]\s*$", joined, re.MULTILINE):
+        return "Y"
+    if re.search(r"\[y/N\]\s*$", joined, re.MULTILINE):
+        return "N"
+    if "Do you want to proceed" in joined:
+        return "?"
+    return None
+
+
+# Phase D: reasoning-block detection patterns
+_REASONING_LINE_RE = re.compile(
+    r"^\s*[✻✶✽✢·●\*◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s*"
+    r"(Thinking|Pondering|Wondering|thinking)",
+    re.IGNORECASE,
+)
+_REASONING_INLINE_RE = re.compile(r"\(thinking\)", re.IGNORECASE)
+
+
+def _split_reasoning(text: str) -> tuple[str, str]:
+    """Phase D: Split text into (reasoning, answer).
+
+    Reasoning is the collection of Claude Code "Thinking..." / "(thinking)" blocks
+    (often indented/quoted continuation lines). If no reasoning is detected, returns
+    ("", text) unchanged.
+
+    Safety: if the split would leave an empty answer (everything looked like reasoning),
+    falls back to the original text as the answer and empty reasoning.
+    """
+    if not text:
+        return "", text
+    lines = text.split("\n")
+    reasoning_lines: list[str] = []
+    answer_lines: list[str] = []
+    in_thinking_block = False
+    for line in lines:
+        if _REASONING_LINE_RE.match(line) or _REASONING_INLINE_RE.search(line):
+            reasoning_lines.append(line)
+            in_thinking_block = True
+            continue
+        if in_thinking_block and line.strip().startswith(("> ", "│ ", "┃ ")):
+            # continuation of thinking block (indented/quoted)
+            reasoning_lines.append(line)
+            continue
+        in_thinking_block = False
+        answer_lines.append(line)
+    reasoning = "\n".join(reasoning_lines).strip()
+    answer = "\n".join(answer_lines).strip()
+    # Safety: if reasoning ate everything, fallback to whole text as answer
+    if not answer and reasoning:
+        return "", text
+    return reasoning, answer or text
 
 
 def get_pane_cwd(target: str) -> str:
@@ -676,6 +766,30 @@ class LiteClaw:
         self._load_agents()
         # Skill loader registry
         self._skills: dict[str, dict] = {}
+        # v0.5.0 UX Overhaul state
+        # F1 Mirror
+        self.mirror_on = MIRROR_ENABLED
+        self._mirror_task: asyncio.Task | None = None
+        self._last_mirror_hash = ""
+        self._mirror_paused_until = 0.0  # time.monotonic()
+        self._last_mirror_capture = ""
+        self._bot_ref = None  # populated in run() post-init
+        # F2 Draft
+        self.draft_on = DRAFT_STREAM_ENABLED
+        self._draft_msg_id: int | None = None
+        self._draft_last_hash = ""
+        self._draft_last_edit_at = 0.0
+        self._draft_interval = DRAFT_STREAM_INTERVAL
+        # F3 Reasoning
+        self.reasoning_on = REASONING_LANE_ENABLED
+        self._reasoning_msg_id: int | None = None
+        # F4 Interactive
+        self._last_interactive_options: list[str] = []  # for free-form parser
+        # F6 Skills home
+        LITECLAW_HOME.mkdir(parents=True, exist_ok=True)
+        SKILLS_PATH.mkdir(parents=True, exist_ok=True)
+        # Load persisted toggles (override env defaults if present)
+        self._load_config()
         # Evolve proposal notification tracking
         self._notified_proposals: set[str] = set()
         # Cron scheduler
@@ -686,6 +800,70 @@ class LiteClaw:
         self._load_cron_jobs()
         # Session recovery state file
         self._state_file = Path(__file__).resolve().parent / ".liteclaw_state.json"
+
+    def _load_config(self):
+        """Load persisted runtime toggles from ~/.liteclaw/config.json."""
+        try:
+            if CONFIG_PATH.exists():
+                data = _json.loads(CONFIG_PATH.read_text())
+                # Only override toggles, not env-controlled tuning
+                self.mirror_on = bool(data.get("mirror_on", self.mirror_on))
+                self.reasoning_on = bool(data.get("reasoning_on", self.reasoning_on))
+                self.draft_on = bool(data.get("draft_on", self.draft_on))
+                self.raw_mode = bool(data.get("raw_mode", self.raw_mode))
+                log.info(f"Loaded runtime config from {CONFIG_PATH}")
+        except Exception as e:
+            log.warning(f"Failed to load config: {e}")
+
+    def _save_config(self):
+        """Persist runtime toggles to ~/.liteclaw/config.json."""
+        try:
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "mirror_on": self.mirror_on,
+                "reasoning_on": self.reasoning_on,
+                "draft_on": self.draft_on,
+                "raw_mode": self.raw_mode,
+            }
+            CONFIG_PATH.write_text(_json.dumps(data, indent=2))
+        except Exception as e:
+            log.warning(f"Failed to save config: {e}")
+
+    async def _edit_with_retry(self, bot, chat_id: int, msg_id: int, text: str,
+                               parse_mode: str | None = None, max_attempts: int = 3) -> bool:
+        """Edit a Telegram message with 3x backoff. Returns True on success.
+        Silently absorbs 'not modified' and 'message to edit not found' errors.
+        On 429 (rate limit), uses exponential backoff."""
+        if not msg_id:
+            return False
+        backoff = 0.5
+        for attempt in range(max_attempts):
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id, text=text,
+                    parse_mode=parse_mode,
+                )
+                return True
+            except Exception as e:
+                msg = str(e).lower()
+                if "not modified" in msg or "message to edit not found" in msg:
+                    return True  # benign
+                if "too many requests" in msg or "flood" in msg:
+                    # Extract retry_after if present, else use escalating backoff
+                    import re as _re
+                    m = _re.search(r"retry after (\d+)", msg)
+                    wait = int(m.group(1)) if m else int(backoff * 4)
+                    log.warning(f"Telegram rate-limited, waiting {wait}s")
+                    await asyncio.sleep(wait)
+                    backoff = min(backoff * 2, 10)
+                    continue
+                if attempt < max_attempts - 1:
+                    await asyncio.sleep(backoff)
+                    backoff *= 2
+                else:
+                    log.warning(f"edit_message_text failed after {max_attempts} attempts: {e}")
+                    return False
+        return False
 
     def _load_agents(self):
         """Load agent registry from .agents.json."""
@@ -803,53 +981,235 @@ class LiteClaw:
         log.info("Session recovery complete")
 
     def _load_skills(self):
-        """Load approved skill files from ~/.liteclaw-evolve/skills/"""
-        skills_dir = Path.home() / ".liteclaw-evolve" / "skills"
-        whitelist_path = skills_dir / "_whitelist.json"
-        if not skills_dir.exists():
+        """Load skills from ~/.liteclaw/skills/ (supports .py and .md).
+
+        Migrates legacy ~/.liteclaw-evolve/skills/ contents on first run when
+        the new skills path is empty.
+        """
+        # Migrate legacy path (copy only when new dir empty)
+        legacy = Path.home() / ".liteclaw-evolve" / "skills"
+        try:
+            if legacy.exists() and SKILLS_PATH.exists() and not any(SKILLS_PATH.iterdir()):
+                import shutil
+                for f in legacy.iterdir():
+                    if f.is_file():
+                        shutil.copy2(f, SKILLS_PATH / f.name)
+                log.info(f"Migrated skills from {legacy} -> {SKILLS_PATH}")
+        except Exception as e:
+            log.warning(f"Skill migration failed: {e}")
+
+        if not SKILLS_PATH.exists():
             return
 
-        approved = []
+        # Remove previously registered skill handlers before reload (so removed
+        # skills don't linger and reloads don't duplicate handlers).
+        self._unregister_skill_handlers()
+
+        self._skills = {}
+        for skill_file in sorted(SKILLS_PATH.iterdir()):
+            if skill_file.name.startswith("_") or skill_file.name.startswith("."):
+                continue
+            if not skill_file.is_file():
+                continue
+            if skill_file.suffix == ".py":
+                self._load_skill_py(skill_file)
+            elif skill_file.suffix == ".md":
+                self._load_skill_md(skill_file)
+
+    def _unregister_skill_handlers(self):
+        """Remove previously-registered skill CommandHandlers from the app."""
+        if not getattr(self, "_app", None) or not self._skills:
+            return
+        try:
+            for group_id, group_handlers in list(self._app.handlers.items()):
+                for h in list(group_handlers):
+                    if isinstance(h, CommandHandler):
+                        cmds = getattr(h, "commands", frozenset()) or frozenset()
+                        if any(c in self._skills for c in cmds):
+                            try:
+                                self._app.remove_handler(h, group=group_id)
+                            except Exception:
+                                pass
+        except Exception as e:
+            log.warning(f"Failed to unregister old skill handlers: {e}")
+
+    def _load_skill_py(self, skill_file: Path):
+        """Load a Python skill file. Requires whitelist approval."""
+        whitelist_path = SKILLS_PATH / "_whitelist.json"
+        approved: list = []
         if whitelist_path.exists():
             try:
                 approved = _json.loads(whitelist_path.read_text())
             except Exception:
+                log.warning(f"Could not read whitelist {whitelist_path}")
+                return
+        if skill_file.name not in approved:
+            log.info(f"Skill '{skill_file.name}' not in whitelist, skipping")
+            return
+        try:
+            ns = {
+                "capture_pane": capture_pane, "send_keys": send_keys,
+                "send_enter": send_enter, "clean_output": clean_output,
+                "log": log, "Path": Path, "subprocess": subprocess,
+                "_json": _json, "asyncio": asyncio, "httpx": httpx,
+            }
+            exec(compile(skill_file.read_text(), str(skill_file), "exec"), ns)
+            cmd_name = ns.get("COMMAND")
+            handler_fn = ns.get("handler")
+            if not (cmd_name and handler_fn):
                 return
 
-        for skill_file in sorted(skills_dir.glob("*.py")):
-            if skill_file.name.startswith("_"):
-                continue
-            if skill_file.name not in approved:
-                log.info(f"Skill '{skill_file.name}' not in whitelist, skipping")
-                continue
+            async def _wrapped(update, ctx, _fn=handler_fn, _claw=self):
+                if not _claw._auth(update):
+                    return
+                await _fn(_claw, update, ctx)
+
+            if self._app:
+                self._app.add_handler(CommandHandler(cmd_name, _wrapped))
+            self._skills[cmd_name] = {
+                "file": skill_file.name,
+                "type": "py",
+                "desc": ns.get("DESCRIPTION", ""),
+            }
+            log.info(f"Loaded PY skill: /{cmd_name} from {skill_file.name}")
+        except Exception as e:
+            log.warning(f"Failed to load PY skill {skill_file.name}: {e}")
+
+    def _load_skill_md(self, path: Path):
+        """Load a Markdown skill: YAML frontmatter + prompt template."""
+        try:
+            content = path.read_text(encoding="utf-8")
+            if not content.startswith("---"):
+                log.warning(f"Skill {path.name}: missing YAML frontmatter")
+                return
+            parts = content.split("---", 2)
+            if len(parts) < 3:
+                return
+            # Parse frontmatter. Prefer pyyaml; fall back to minimal parser.
             try:
-                ns = {
-                    "capture_pane": capture_pane, "send_keys": send_keys,
-                    "send_enter": send_enter, "clean_output": clean_output,
-                    "log": log, "Path": Path, "subprocess": subprocess,
-                    "_json": _json, "asyncio": asyncio, "httpx": httpx,
-                }
-                exec(compile(skill_file.read_text(), str(skill_file), "exec"), ns)
-                cmd_name = ns.get("COMMAND")
-                handler_fn = ns.get("handler")
-                if cmd_name and handler_fn:
-                    claw_ref = self
-                    fn_ref = handler_fn
-                    async def _make_handler(fn, claw):
-                        async def _wrapped(update, ctx, _fn=fn, _claw=claw):
-                            if not _claw._auth(update):
-                                return
-                            await _fn(_claw, update, ctx)
-                        return _wrapped
-                    import asyncio as _aio
-                    loop = _aio.new_event_loop()
-                    wrapped = loop.run_until_complete(_make_handler(fn_ref, claw_ref))
-                    loop.close()
-                    self._app.add_handler(CommandHandler(cmd_name, wrapped))
-                    self._skills[cmd_name] = {"file": skill_file.name, "desc": ns.get("DESCRIPTION", "")}
-                    log.info(f"Skill loaded: /{cmd_name} from {skill_file.name}")
+                import yaml
+                meta = yaml.safe_load(parts[1]) or {}
+            except Exception:
+                meta = {}
+                for line in parts[1].splitlines():
+                    if ":" not in line:
+                        continue
+                    k, _, v = line.partition(":")
+                    k = k.strip()
+                    v = v.strip().strip('"').strip("'")
+                    if k:
+                        meta[k] = v
+            prompt_template = parts[2].strip()
+            cmd_name = meta.get("command") or path.stem
+            if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", str(cmd_name)):
+                log.warning(f"Skill {path.name}: invalid command name '{cmd_name}'")
+                return
+            description = meta.get("description", "") or ""
+
+            async def md_handler(update, context, _template=prompt_template, _name=cmd_name):
+                if not self._auth(update):
+                    return
+                args_text = " ".join(context.args) if context.args else ""
+                rendered = _template.replace("{{args}}", args_text)
+                await self._inject_prompt_from_skill(update, context, rendered, _name)
+
+            if self._app:
+                self._app.add_handler(CommandHandler(cmd_name, md_handler))
+            self._skills[cmd_name] = {
+                "file": path.name,
+                "type": "md",
+                "desc": description,
+            }
+            log.info(f"Loaded MD skill: /{cmd_name} from {path.name}")
+        except Exception as e:
+            log.warning(f"Failed to load MD skill {path.name}: {e}")
+
+    async def _inject_prompt_from_skill(self, update, context, rendered_prompt: str, skill_name: str):
+        """Inject a rendered skill prompt into the Claude session as if the
+        user had typed it. Reuses the main handle_message pipeline."""
+        if self.busy:
+            await update.message.reply_text("⏳ Claude is busy, try again shortly.")
+            return
+        await update.message.reply_text(f"▶️ Running skill: /{skill_name}")
+        try:
+            update.message.text = rendered_prompt
+        except Exception:
+            try:
+                object.__setattr__(update.message, "text", rendered_prompt)
             except Exception as e:
-                log.warning(f"Failed to load skill {skill_file.name}: {e}")
+                log.warning(f"Skill /{skill_name}: cannot rewrite text ({e})")
+                await update.message.reply_text("❌ Cannot inject skill prompt.")
+                return
+        await self.handle_message(update, context)
+
+    async def _register_native_commands(self, bot=None):
+        """Register all loaded commands with Telegram's native menu
+        (overrides OpenClaw pollution)."""
+        if not SKILLS_NATIVE_MENU:
+            return
+        try:
+            b = bot or self._bot_ref
+            if not b:
+                return
+            from telegram import BotCommand
+            cmds = [
+                BotCommand("start", "Show help"),
+                BotCommand("help", "Show help"),
+                BotCommand("status", "Show last 30 lines of pane"),
+                BotCommand("raw", "Toggle raw output mode"),
+                BotCommand("mirror", "Toggle CLI→Telegram mirror"),
+                BotCommand("reasoning", "Toggle thinking lane"),
+                BotCommand("lcskill", "Manage liteclaw skills"),
+                BotCommand("cancel", "Ctrl+C current pane"),
+                BotCommand("escape", "Send Escape"),
+                BotCommand("sessions", "List tmux sessions"),
+                BotCommand("agents", "List agents"),
+                BotCommand("recall", "Search history"),
+                BotCommand("cron", "Manage cron jobs"),
+            ]
+            for name, info in self._skills.items():
+                desc = info.get("desc", "") or "Skill"
+                cmds.append(BotCommand(name, desc[:256]))
+            await b.set_my_commands(cmds)
+            log.info(f"Registered {len(cmds)} Telegram native commands")
+        except Exception as e:
+            log.warning(f"Native command register failed: {e}")
+
+    async def _native_menu_periodic(self):
+        """Periodically re-register native commands to resist OpenClaw
+        gateway restarts that overwrite setMyCommands."""
+        while True:
+            await asyncio.sleep(600)  # 10 min
+            try:
+                await self._register_native_commands()
+            except Exception:
+                pass
+
+    async def _skills_hot_reload_loop(self):
+        """Watch SKILLS_PATH for mtime changes and reload on change."""
+        if not SKILLS_HOT_RELOAD:
+            return
+        last_sig = None
+        while True:
+            try:
+                await asyncio.sleep(10)
+                if not SKILLS_PATH.exists():
+                    continue
+                sig = 0
+                for f in SKILLS_PATH.iterdir():
+                    if f.is_file() and not f.name.startswith("."):
+                        try:
+                            sig ^= hash((f.name, int(f.stat().st_mtime)))
+                        except Exception:
+                            pass
+                if last_sig is not None and sig != last_sig:
+                    log.info("Skill directory changed, hot-reloading...")
+                    self._load_skills()
+                    if self._bot_ref:
+                        await self._register_native_commands()
+                last_sig = sig
+            except Exception as e:
+                log.warning(f"Skills hot-reload loop error: {e}")
 
     # -- Cron job management --
 
@@ -1074,6 +1434,90 @@ class LiteClaw:
         )
         self._pipe_active = False
 
+    def _mirror_diff(self, old: str, new: str) -> str:
+        """Compute newly-appeared content in `new` versus `old` capture.
+
+        If old is empty, return the last 15 non-empty lines of new.
+        Otherwise, anchor on the last 3 non-empty lines of old found within
+        new and return whatever follows that match.
+        """
+        new_nonempty = [l for l in new.split("\n") if l.strip()]
+        if not new_nonempty:
+            return ""
+        if not old or not old.strip():
+            return "\n".join(new_nonempty[-15:])
+
+        old_nonempty = [l for l in old.split("\n") if l.strip()]
+        if not old_nonempty:
+            return "\n".join(new_nonempty[-15:])
+
+        # Anchor on last 3 meaningful lines of old. Walk new from the end
+        # looking for the same 3-line sequence.
+        anchor = old_nonempty[-3:]
+        anchor_len = len(anchor)
+        for i in range(len(new_nonempty) - anchor_len, -1, -1):
+            if new_nonempty[i:i + anchor_len] == anchor:
+                tail = new_nonempty[i + anchor_len:]
+                if tail:
+                    return "\n".join(tail)
+                return ""
+        # No anchor found — likely scrolled out. Fall back to last 15 lines.
+        return "\n".join(new_nonempty[-15:])
+
+    async def _mirror_loop(self):
+        """Periodically poll tmux pane and forward new CLI activity to Telegram.
+
+        Respects self.busy (skip while normal request is in flight) and
+        self._mirror_paused_until (skip right after we injected keys so our
+        own echo is not mirrored back).
+        """
+        log.info("Mirror loop running")
+        try:
+            while self.mirror_on:
+                await asyncio.sleep(MIRROR_POLL_INTERVAL)
+                if not self.mirror_on:
+                    break
+                if self.busy:
+                    continue
+                if time.monotonic() < self._mirror_paused_until:
+                    continue
+                try:
+                    capture = capture_pane(self.target, lines=40)
+                except Exception as e:
+                    log.debug(f"Mirror capture failed: {e}")
+                    continue
+                cleaned = clean_output(capture).strip()
+                if not cleaned:
+                    continue
+                # Use last 10 non-empty lines as "recent activity" window
+                recent_lines = [l for l in cleaned.split("\n") if l.strip()][-10:]
+                recent = "\n".join(recent_lines)
+                h = hashlib.md5(recent.encode()).hexdigest()
+                if h == self._last_mirror_hash:
+                    continue
+                new_content = self._mirror_diff(self._last_mirror_capture, cleaned)
+                self._last_mirror_capture = cleaned
+                self._last_mirror_hash = h
+                if not new_content or not new_content.strip():
+                    continue
+                if len(new_content) < 5:
+                    continue  # too trivial
+                if self._bot_ref is None:
+                    continue
+                try:
+                    await self._bot_ref.send_message(
+                        chat_id=CHAT_ID,
+                        text=f"🔁 CLI mirror\n\n{new_content[:3500]}",
+                    )
+                except Exception as e:
+                    log.warning(f"Mirror send failed: {e}")
+                await asyncio.sleep(MIRROR_DEBOUNCE)
+        except asyncio.CancelledError:
+            log.info("Mirror loop cancelled")
+            raise
+        except Exception:
+            log.exception("Mirror loop crashed")
+
     def _record_offset(self):
         """Record current end of pipe log file."""
         if self._log_path and os.path.exists(self._log_path):
@@ -1216,6 +1660,74 @@ class LiteClaw:
         self._log_event("mode_toggle", f"raw={'on' if self.raw_mode else 'off'}")
         mode = "ON (raw output)" if self.raw_mode else "OFF (summarized)"
         await update.message.reply_text(f"Raw mode: {mode}")
+
+    async def cmd_mirror(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Toggle CLI mirror — forwards direct terminal activity to Telegram."""
+        if not self._auth(update):
+            return
+        args = ctx.args or []
+        if not args or args[0].lower() == "status":
+            state = "ON" if self.mirror_on else "OFF"
+            warn = "\n⚠️ Terminal output is being forwarded to Telegram" if self.mirror_on else ""
+            await update.message.reply_text(
+                f"🔁 CLI Mirror: *{state}*\n"
+                f"Debounce: {MIRROR_DEBOUNCE}s | Poll: {MIRROR_POLL_INTERVAL}s"
+                f"{warn}",
+                parse_mode="Markdown",
+            )
+            return
+        action = args[0].lower()
+        if action == "on":
+            self.mirror_on = True
+            self._save_config()
+            if self._bot_ref is None:
+                self._bot_ref = ctx.bot
+            if self._mirror_task is None or self._mirror_task.done():
+                self._mirror_task = asyncio.create_task(self._mirror_loop())
+            await update.message.reply_text(
+                "🔁 CLI Mirror: *ON*\n⚠️ Terminal output will be forwarded to Telegram",
+                parse_mode="Markdown",
+            )
+        elif action == "off":
+            self.mirror_on = False
+            self._save_config()
+            if self._mirror_task and not self._mirror_task.done():
+                self._mirror_task.cancel()
+            await update.message.reply_text("🔁 CLI Mirror: *OFF*", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Usage: /mirror on|off|status")
+
+    async def cmd_reasoning(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Toggle reasoning lane — split Thinking blocks into a separate message."""
+        if not self._auth(update):
+            return
+        args = ctx.args or []
+        action = args[0].lower() if args else "status"
+        if action == "status":
+            state = "ON" if self.reasoning_on else "OFF"
+            detail = (
+                "Thinking blocks will be separated"
+                if self.reasoning_on
+                else "Thinking blocks will appear inline"
+            )
+            await update.message.reply_text(
+                f"{REASONING_PREFIX} Reasoning lane: *{state}*\n{detail}.",
+                parse_mode="Markdown",
+            )
+        elif action == "on":
+            self.reasoning_on = True
+            self._save_config()
+            await update.message.reply_text(
+                f"{REASONING_PREFIX} Reasoning lane: *ON*", parse_mode="Markdown",
+            )
+        elif action == "off":
+            self.reasoning_on = False
+            self._save_config()
+            await update.message.reply_text(
+                f"{REASONING_PREFIX} Reasoning lane: *OFF*", parse_mode="Markdown",
+            )
+        else:
+            await update.message.reply_text("Usage: /reasoning on|off|status")
 
     async def cmd_model(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not self._auth(update):
@@ -1756,6 +2268,86 @@ class LiteClaw:
                 "/evolve skill list|reload — Manage skills"
             )
 
+    async def cmd_lcskill(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Manage LiteClaw skills: list | reload | new <name> | remove <name>."""
+        if not self._auth(update):
+            return
+        args = ctx.args or []
+        if not args:
+            args = ["list"]
+        sub = args[0].lower()
+
+        if sub == "list":
+            if not self._skills:
+                await update.message.reply_text(
+                    f"No skills loaded.\nAdd files to {SKILLS_PATH}"
+                )
+                return
+            lines = [f"*LiteClaw Skills* ({len(self._skills)})"]
+            for name, info in sorted(self._skills.items()):
+                typ = info.get("type", "py")
+                desc = info.get("desc", "")
+                lines.append(f"/{name} _({typ})_ — {desc}")
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+        elif sub == "reload":
+            self._load_skills()
+            if self._bot_ref:
+                await self._register_native_commands()
+            await update.message.reply_text(f"✅ Reloaded {len(self._skills)} skills")
+
+        elif sub == "new" and len(args) >= 2:
+            name = args[1].lstrip("/")
+            if not re.match(r"^[a-zA-Z][a-zA-Z0-9_]*$", name):
+                await update.message.reply_text("Invalid name. Use [a-zA-Z][a-zA-Z0-9_]*")
+                return
+            path = SKILLS_PATH / f"{name}.md"
+            if path.exists():
+                await update.message.reply_text(f"Skill already exists: {path}")
+                return
+            template = (
+                "---\n"
+                f"command: {name}\n"
+                "description: TODO describe this skill\n"
+                "---\n"
+                f"TODO: Write the prompt that Claude should execute when /{name} is invoked.\n"
+                "Use {{args}} to reference arguments.\n"
+            )
+            try:
+                path.write_text(template, encoding="utf-8")
+            except Exception as e:
+                await update.message.reply_text(f"❌ Failed to create skill: {e}")
+                return
+            await update.message.reply_text(
+                f"✅ Created {path}\n\nEdit the file to add prompt, then run /lcskill reload",
+                parse_mode="Markdown",
+            )
+
+        elif sub == "remove" and len(args) >= 2:
+            name = args[1].lstrip("/")
+            removed = False
+            for ext in (".md", ".py"):
+                p = SKILLS_PATH / f"{name}{ext}"
+                if p.exists():
+                    try:
+                        p.unlink()
+                        removed = True
+                    except Exception as e:
+                        await update.message.reply_text(f"❌ Failed to remove {p}: {e}")
+                        return
+            if removed:
+                self._load_skills()
+                if self._bot_ref:
+                    await self._register_native_commands()
+                await update.message.reply_text(f"🗑️ Removed skill: {name}")
+            else:
+                await update.message.reply_text(f"Not found: {name}")
+
+        else:
+            await update.message.reply_text(
+                "Usage: /lcskill list | reload | new <name> | remove <name>"
+            )
+
     async def _check_evolve_proposals(self, context):
         """Check for new pending proposals and notify via Telegram."""
         proposals_file = Path.home() / "projects/liteclaw/.evolve/data/proposals.jsonl"
@@ -2218,6 +2810,37 @@ class LiteClaw:
         if not user_text:
             return
 
+        # Free-form answer to a pending interactive prompt?
+        # Must run BEFORE the busy check so the user can answer while bot is still polling.
+        if getattr(self, '_interactive_sent', False) and self._last_interactive_options:
+            idx = await self._interpret_user_answer(user_text)
+            if idx is not None:
+                try:
+                    await update.message.reply_text(f"🎯 Interpreted as option {idx+1}")
+                except Exception:
+                    pass
+                success = await self._click_option(idx)
+                if success:
+                    self._interactive_sent = False
+                    self._last_interactive_options = []
+                else:
+                    try:
+                        await update.message.reply_text(
+                            "⚠️ Failed to dispatch selection. Please try again."
+                        )
+                    except Exception:
+                        pass
+                return
+            else:
+                try:
+                    await update.message.reply_text(
+                        "⚠️ Couldn't determine which option you meant. Please be more "
+                        "specific (e.g. \"1번\", \"the second one\", or the option text)."
+                    )
+                except Exception:
+                    pass
+                return
+
         if self.busy:
             await update.message.reply_text("⏳ Still processing. Use /cancel to abort.")
             return
@@ -2225,6 +2848,7 @@ class LiteClaw:
         t0 = time.monotonic()
         self.busy = True
         self._interactive_sent = False  # reset for new message
+        self._last_interactive_options = []  # clear stale options
         self._last_activity = datetime.now().isoformat()
         log.info(f"Received: {user_text[:80]}...")
 
@@ -2261,6 +2885,8 @@ class LiteClaw:
             # Send to tmux (Claude Code queues input even when busy)
             send_keys(self.target, user_text)
             send_enter(self.target)
+            # Pause mirror briefly so the echoed injection is not forwarded back
+            self._mirror_paused_until = time.monotonic() + 5.0
 
             sent_msg = None
             if claude_idle:
@@ -2320,10 +2946,36 @@ class LiteClaw:
             self.busy = False
 
     async def _deliver_response(self, response: str, user_text: str, update: Update, ctx: ContextTypes.DEFAULT_TYPE, meta: dict = None) -> int | None:
-        """Deliver response to Telegram with retry. Summarizes unless raw mode. Returns last message_id."""
+        """Deliver response to Telegram with retry. Summarizes unless raw mode. Returns last message_id.
+        Phase C: If a draft message is active, edit it in-place with the final answer (single-chunk only).
+        Phase D: If reasoning lane is enabled, extract thinking blocks and send them as a separate message
+        BEFORE summarizing/delivering the answer.
+        """
         if not response.strip():
             await update.message.reply_text("(empty response)")
             return None
+
+        # Phase D: split reasoning from answer BEFORE summarization/chunking
+        reasoning_text = ""
+        if self.reasoning_on and REASONING_LANE_ENABLED:
+            reasoning_text, response = _split_reasoning(response)
+
+        # Phase D: send reasoning as its own message first, track id for follow-up
+        if reasoning_text and self.reasoning_on and REASONING_LANE_ENABLED:
+            try:
+                reasoning_body = html.escape(reasoning_text[:3500])
+                reasoning_msg = f"{REASONING_PREFIX} <i>Thinking</i>\n\n<pre>{reasoning_body}</pre>"
+                msg = await ctx.bot.send_message(
+                    chat_id=CHAT_ID, text=reasoning_msg, parse_mode="HTML",
+                )
+                self._reasoning_msg_id = msg.message_id
+                log.info(f"Reasoning sent: {len(reasoning_text)} chars (msg_id={msg.message_id})")
+            except Exception as e:
+                log.warning(f"Reasoning send failed: {e}")
+
+        # Guard: if the split left nothing to deliver, fall back to a minimal answer
+        if not response.strip():
+            response = "(reasoning only — no final answer extracted)"
 
         if not self.raw_mode:
             try:
@@ -2343,6 +2995,34 @@ class LiteClaw:
 
         chunks = split_message(response)
         log.info(f"Delivering response: {len(response)} chars in {len(chunks)} chunk(s)")
+
+        # Phase C: try to edit the live draft message in place (single-chunk only)
+        use_draft = bool(self.draft_on and DRAFT_STREAM_ENABLED and self._draft_msg_id)
+        if use_draft:
+            if len(chunks) == 1:
+                ok = await self._edit_with_retry(
+                    ctx.bot, CHAT_ID, self._draft_msg_id, chunks[0],
+                )
+                if ok:
+                    last_msg_id = self._draft_msg_id
+                    self._draft_msg_id = None
+                    # Log + state-save (mirror legacy path tail)
+                    if meta is not None:
+                        meta["sum_len"] = len(response)
+                    self._log_conversation(user_text, response, summarized=not self.raw_mode, meta=meta)
+                    self._save_state()
+                    log.info(f"Draft edited in-place: msg_id={last_msg_id} ({len(chunks[0])} chars)")
+                    return last_msg_id
+                # Edit failed — fall through to send-new path below
+                log.warning("Draft edit-in-place failed, falling back to send-new")
+            else:
+                # Multi-chunk: delete draft, use legacy send path
+                try:
+                    await ctx.bot.delete_message(chat_id=CHAT_ID, message_id=self._draft_msg_id)
+                except Exception:
+                    pass
+                self._draft_msg_id = None
+
         last_msg_id = None
         for i, chunk in enumerate(chunks):
             header = f"[{i+1}/{len(chunks)}]\n" if len(chunks) > 1 else ""
@@ -2411,14 +3091,10 @@ class LiteClaw:
                             [l for l in status_text.split("\n") if l.strip()][-3:]
                         )
                         if preview:
-                            try:
-                                await bot.edit_message_text(
-                                    chat_id=CHAT_ID,
-                                    message_id=msg_id,
-                                    text=f"⏳ Working... ({elapsed + 15}s)\n\n{preview[:3500]}",
-                                )
-                            except Exception:
-                                pass
+                            await self._edit_with_retry(
+                                bot, CHAT_ID, msg_id,
+                                f"⏳ Working... ({elapsed + 15}s)\n\n{preview[:3500]}",
+                            )
 
                     await asyncio.sleep(5)
                 except Exception as e:
@@ -2458,16 +3134,11 @@ class LiteClaw:
                         pass
                 chunks = split_message(new_response)
                 if len(chunks) == 1:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=CHAT_ID,
-                            message_id=msg_id,
-                            text=chunks[0],
-                        )
+                    ok = await self._edit_with_retry(
+                        bot, CHAT_ID, msg_id, chunks[0],
+                    )
+                    if ok:
                         log.info(f"Follow-up edit: updated msg {msg_id} ({len(chunks[0])} chars)")
-                    except Exception as e:
-                        if "not modified" not in str(e).lower():
-                            log.warning(f"Follow-up edit failed: {e}")
                 else:
                     try:
                         await bot.delete_message(chat_id=CHAT_ID, message_id=msg_id)
@@ -2515,13 +3186,11 @@ class LiteClaw:
                         pass
                 chunks = split_message(final_response)
                 if len(chunks) == 1:
-                    try:
-                        await bot.edit_message_text(
-                            chat_id=CHAT_ID, message_id=msg_id, text=chunks[0],
-                        )
+                    ok = await self._edit_with_retry(
+                        bot, CHAT_ID, msg_id, chunks[0],
+                    )
+                    if ok:
                         log.info(f"Follow-up: final edit to msg {msg_id} ({len(chunks[0])} chars)")
-                    except Exception:
-                        pass
                 else:
                     try:
                         await bot.delete_message(chat_id=CHAT_ID, message_id=msg_id)
@@ -2620,42 +3289,235 @@ class LiteClaw:
             lines.append("\nReply with the number to select.")
             await bot.send_message(chat_id=CHAT_ID, text="\n".join(lines))
 
+    async def _send_yn_prompt(self, bot, default: str, context_snippet: str):
+        """Send a Y/N confirmation prompt as Telegram inline keyboard.
+
+        default: "Y" (default yes), "N" (default no), or "?" (no default).
+        context_snippet: recent pane lines to show what Claude is asking.
+        """
+        if default == "Y":
+            buttons = [[
+                InlineKeyboardButton("✅ Yes (default)", callback_data="yn:y"),
+                InlineKeyboardButton("No", callback_data="yn:n"),
+            ]]
+            hint = "Press Yes (default) or No"
+        elif default == "N":
+            buttons = [[
+                InlineKeyboardButton("Yes", callback_data="yn:y"),
+                InlineKeyboardButton("❌ No (default)", callback_data="yn:n"),
+            ]]
+            hint = "Press No (default) or Yes"
+        else:  # "?"
+            buttons = [[
+                InlineKeyboardButton("✅ Yes", callback_data="yn:y"),
+                InlineKeyboardButton("❌ No", callback_data="yn:n"),
+            ]]
+            hint = "Please choose"
+        markup = InlineKeyboardMarkup(buttons)
+        preview = context_snippet[-500:] if context_snippet else ""
+        text = f"❓ Claude is asking\n\n<pre>{html.escape(preview)}</pre>\n\n{hint}"
+        try:
+            await bot.send_message(
+                chat_id=CHAT_ID,
+                text=text,
+                reply_markup=markup,
+                parse_mode="HTML",
+            )
+            log.info(f"Y/N prompt sent (default={default})")
+        except Exception as e:
+            log.warning(f"Y/N prompt send failed: {e}")
+
+    async def _click_option(self, idx: int) -> bool:
+        """Navigate to option idx (0-based) and press Enter.
+        idx==0 means first option (already pre-selected): press Enter only.
+        Otherwise press Down idx times with verification, then Enter.
+        Returns True on successful dispatch, False otherwise.
+        """
+        try:
+            if idx < 0:
+                return False
+            # idx 0: first option is usually pre-selected — just Enter
+            if idx == 0:
+                send_keys(self.target, "Enter", literal=False)
+                return True
+            # Capture pane before navigation for verification
+            pre = capture_pane(self.target, lines=20)
+            for i in range(idx):
+                send_keys(self.target, "Down", literal=False)
+                await asyncio.sleep(DOWN_KEY_DELAY)
+                post = capture_pane(self.target, lines=20)
+                if post == pre:
+                    # No visible change — may still be valid if render is lagged
+                    log.warning(f"Down key {i+1}/{idx} showed no pane change")
+                pre = post
+            send_keys(self.target, "Enter", literal=False)
+            return True
+        except Exception as e:
+            log.warning(f"_click_option failed: {e}")
+            return False
+
     async def _handle_callback(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        """Handle inline keyboard button presses for interactive prompts."""
+        """Handle inline keyboard button presses for interactive prompts.
+
+        Supports callback data prefixes:
+          yn:y / yn:n         -> Y/N confirmation
+          pick:{idx}:{label}  -> selection menu option
+        """
         query = update.callback_query
-        if not query or not query.data.startswith("pick:"):
+        data = query.data or "" if query else ""
+        if not query:
             return
-        await query.answer()
+        try:
+            await query.answer()
+        except Exception:
+            pass
 
-        parts = query.data.split(":", 2)
-        if len(parts) < 3:
-            return
-        idx = int(parts[1])
-        label = parts[2]
+        try:
+            # --- Y/N confirmation branch ---
+            if data.startswith("yn:"):
+                choice = data.split(":", 1)[1]  # "y" or "n"
+                send_keys(self.target, choice, literal=True)
+                await asyncio.sleep(0.1)
+                send_keys(self.target, "Enter", literal=False)
+                self._interactive_sent = False
+                try:
+                    await query.edit_message_text(f"✅ Sent: {choice.upper()}")
+                except Exception:
+                    pass
+                log.info(f"Y/N callback handled: choice={choice}")
+                return
 
-        # Send arrow keys to select the option, then Enter
-        # Claude Code uses arrow keys to navigate: first option is already selected (index 0)
-        # We need to press Down `idx` times, then Enter
-        target = self.target
-        for _ in range(idx):
-            subprocess.run(["tmux", "send-keys", "-t", target, "Down"], capture_output=True)
-            await asyncio.sleep(0.1)
-        send_enter(target)
+            # --- Selection menu branch ---
+            if data.startswith("pick:"):
+                parts = data.split(":", 2)
+                if len(parts) < 2:
+                    try:
+                        await query.edit_message_text("⚠️ Invalid callback data")
+                    except Exception:
+                        pass
+                    return
+                try:
+                    idx = int(parts[1])
+                except ValueError:
+                    try:
+                        await query.edit_message_text("⚠️ Invalid index")
+                    except Exception:
+                        pass
+                    return
+                label = parts[2] if len(parts) >= 3 else ""
+                success = await self._click_option(idx)
+                if success:
+                    try:
+                        if label:
+                            await query.edit_message_text(f"✅ Selected option {idx+1}: {label}")
+                        else:
+                            await query.edit_message_text(f"✅ Selected option {idx+1}")
+                    except Exception:
+                        pass
+                    log.info(f"Interactive selection: index={idx} label={label}")
+                else:
+                    # Callback failure — notify user and offer text-fallback
+                    try:
+                        await query.edit_message_text(
+                            f"⚠️ Button failed — please reply with text\n"
+                            f"(e.g. \"{idx+1}번\" or option text)"
+                        )
+                    except Exception:
+                        pass
+                    log.warning(f"Interactive selection dispatch failed: index={idx}")
+                self._interactive_sent = False
+                return
 
-        self._interactive_sent = False  # reset for next prompt
-        await query.edit_message_text(f"✅ Selected: {label}")
-        log.info(f"Interactive selection: index={idx} label={label}")
+            # Unknown prefix
+            try:
+                await query.edit_message_text("⚠️ Unknown callback")
+            except Exception:
+                pass
+        except Exception as e:
+            log.warning(f"Callback handler error: {e}")
+
+    async def _interpret_user_answer(self, answer: str) -> int | None:
+        """Interpret a free-form text answer as an option index (0-based).
+        Returns None if unclear or disabled. Uses cheap heuristics first,
+        then falls back to the summarizer LLM for tricky cases."""
+        if not INTERACTIVE_FREEFORM:
+            return None
+        opts = self._last_interactive_options
+        if not opts:
+            return None
+        answer_lower = answer.strip().lower()
+        if not answer_lower:
+            return None
+
+        # Quick numeric / ordinal heuristics (Korean + English)
+        numeric_map = {
+            "1": 0, "1번": 0, "첫": 0, "첫번째": 0, "첫번째꺼": 0, "first": 0,
+            "2": 1, "2번": 1, "두번째": 1, "second": 1,
+            "3": 2, "3번": 2, "세번째": 2, "third": 2,
+            "4": 3, "4번": 3, "네번째": 3, "fourth": 3,
+            "5": 4, "5번": 4, "다섯번째": 4, "fifth": 4,
+        }
+        for k, v in numeric_map.items():
+            if (
+                answer_lower == k
+                or answer_lower.startswith(k + " ")
+                or answer_lower.startswith(k + "번")
+            ):
+                if v < len(opts):
+                    return v
+
+        # Substring match: option text mentioned in answer (or vice versa)
+        for i, opt in enumerate(opts):
+            opt_lower = opt.lower().strip()
+            if not opt_lower:
+                continue
+            if opt_lower in answer_lower or answer_lower in opt_lower:
+                return i
+
+        # LLM fallback via existing _summarize infrastructure
+        try:
+            options_text = "\n".join(f"{i+1}. {opt}" for i, opt in enumerate(opts))
+            prompt = (
+                f"User was shown this menu:\n{options_text}\n\n"
+                f"User replied: \"{answer}\"\n\n"
+                f"Which option number (1-{len(opts)}) does the user most likely want? "
+                f"Respond with JUST the number, or 'unknown' if unclear."
+            )
+            response = await self._summarize(prompt, "")
+            response = (response or "").strip()
+            m = re.search(r"\b([1-9]\d?)\b", response)
+            if m:
+                num = int(m.group(1))
+                if 1 <= num <= len(opts):
+                    return num - 1
+        except Exception as e:
+            log.warning(f"LLM interpret failed: {e}")
+        return None
 
     async def _poll_response(self, bot, user_text: str = "", pre_snapshot: str = "") -> str:
-        """Poll until response stabilizes. Uses pipe-pane log for output, capture-pane for prompt detection."""
+        """Poll until response stabilizes. Uses pipe-pane log for output, capture-pane for prompt detection.
+        Phase C: When draft streaming is enabled, uses self._draft_msg_id to edit-in-place instead of
+        sending a temporary status message that gets deleted.
+        """
         prev_content = ""
         stable_count = 0
         prompt_count = 0  # consecutive polls where prompt is visible
         elapsed = 0.0
         last_typing = 0.0
         last_status = 0.0
-        status_interval = INTERMEDIATE_INTERVAL  # starts at 10s, grows to 60s
-        status_msg_id = None
+
+        # Phase C: decide whether to use draft streaming (edit-in-place) or legacy (status msg + delete)
+        use_draft = bool(self.draft_on and DRAFT_STREAM_ENABLED)
+        if use_draft:
+            status_interval = float(DRAFT_STREAM_INTERVAL)
+            # Reset per-request draft state so we start fresh
+            self._draft_last_hash = ""
+            self._draft_last_edit_at = 0.0
+            # self._draft_msg_id stays None until first preview send; _deliver_response consumes it
+        else:
+            status_interval = INTERMEDIATE_INTERVAL  # starts at 10s, grows to 60s
+        status_msg_id = None  # legacy-only: temp status message id to delete at end
+        preview_msg = ""       # last rendered preview text (used for TIMEOUT decoration)
 
         await asyncio.sleep(2)
         elapsed += 2
@@ -2691,35 +3553,87 @@ class LiteClaw:
             # Interactive prompt detection: stable + no activity + not idle = waiting for input
             _recent = "\n".join(pane_content.strip().split("\n")[-10:])
             if stable_count >= 3 and not _ACTIVITY_PATTERNS.search(_recent) and not is_idle_prompt(pane_content):
+                # Y/N confirmation detection runs first (cheaper, more specific)
+                if INTERACTIVE_AUTO_YN and not getattr(self, '_interactive_sent', False):
+                    yn = _detect_yn_prompt(pane_content)
+                    if yn:
+                        self._interactive_sent = True
+                        snippet = "\n".join(
+                            [l for l in pane_content.split("\n") if l.strip()][-8:]
+                        )
+                        await self._send_yn_prompt(bot, yn, snippet)
+
                 interactive = detect_interactive_prompt(pane_content)
                 if interactive and not getattr(self, '_interactive_sent', False):
                     self._interactive_sent = True
+                    # Save options for free-form answer parser
+                    self._last_interactive_options = list(interactive.get("options", []))
                     await self._send_interactive_prompt(bot, interactive)
 
             # Status update at adaptive interval — show last few meaningful lines
             if elapsed - last_status >= status_interval:
-                status_capture = capture_pane(self.target, lines=10)
+                last_status = elapsed
+                status_capture = capture_pane(self.target, lines=15)
                 preview_text = clean_output(status_capture).strip()
                 if preview_text:
                     preview_lines = [l for l in preview_text.split("\n") if l.strip()][-5:]
                     preview = "\n".join(preview_lines)
-                    status_text = f"⏳ Working... ({int(elapsed)}s)\n\n{preview[:1500]}"
-                    try:
-                        if status_msg_id:
-                            await bot.edit_message_text(
-                                chat_id=CHAT_ID,
-                                message_id=status_msg_id,
-                                text=status_text,
-                            )
-                        else:
-                            msg = await bot.send_message(
-                                chat_id=CHAT_ID, text=status_text,
-                            )
-                            status_msg_id = msg.message_id
-                    except Exception:
-                        pass
-                last_status = elapsed
-                status_interval = min(status_interval + 5, 60)
+
+                    if use_draft:
+                        # Phase C: hash-gate + 1 edit/sec rate limit + edit-in-place
+                        preview_msg = f"💭 Working...\n\n<pre>{html.escape(preview[-2000:])}</pre>"
+                        h = hashlib.md5(preview.encode()).hexdigest()
+                        skip = False
+                        if h == self._draft_last_hash:
+                            skip = True
+                        now = time.monotonic()
+                        if not skip and (now - self._draft_last_edit_at) < 1.0:
+                            skip = True
+                        if not skip:
+                            self._draft_last_hash = h
+                            self._draft_last_edit_at = now
+                            if self._draft_msg_id is None:
+                                try:
+                                    msg = await bot.send_message(
+                                        chat_id=CHAT_ID,
+                                        text=preview_msg,
+                                        parse_mode="HTML",
+                                    )
+                                    self._draft_msg_id = msg.message_id
+                                except Exception as e:
+                                    msg_l = str(e).lower()
+                                    if "too many requests" in msg_l or "flood" in msg_l:
+                                        # 429 backoff: bump interval to 12s
+                                        status_interval = max(status_interval, 12.0)
+                                    log.warning(f"Draft send failed: {e}")
+                            else:
+                                ok = await self._edit_with_retry(
+                                    bot, CHAT_ID, self._draft_msg_id,
+                                    preview_msg, parse_mode="HTML",
+                                )
+                                if not ok:
+                                    # persistent edit failure — treat like 429 backoff
+                                    status_interval = max(status_interval, 12.0)
+                        # Adaptive interval grows but caps at 4x configured interval
+                        status_interval = min(status_interval + 2, DRAFT_STREAM_INTERVAL * 4)
+                    else:
+                        # Legacy path: temp status message, delete at end
+                        status_text = f"⏳ Working... ({int(elapsed)}s)\n\n{preview[:1500]}"
+                        try:
+                            if status_msg_id:
+                                await bot.edit_message_text(
+                                    chat_id=CHAT_ID,
+                                    message_id=status_msg_id,
+                                    text=status_text,
+                                )
+                            else:
+                                msg = await bot.send_message(
+                                    chat_id=CHAT_ID, text=status_text,
+                                )
+                                status_msg_id = msg.message_id
+                        except Exception:
+                            pass
+                        status_interval = min(status_interval + 5, 60)
 
             # Done: idle prompt confirmed (~7.5s continuous idle)
             if elapsed >= 5 and prompt_count >= 5:
@@ -2731,10 +3645,27 @@ class LiteClaw:
         else:
             log.warning(f"Timeout after {MAX_WAIT}s")
 
-        # Clean up status message
+        # Clean up status message (legacy path only). In draft path we keep _draft_msg_id
+        # so _deliver_response can edit it in place with the final answer.
         if status_msg_id:
             try:
                 await bot.delete_message(chat_id=CHAT_ID, message_id=status_msg_id)
+            except Exception:
+                pass
+
+        # On timeout under draft streaming, decorate the draft with a TIMEOUT prefix
+        # so the user sees the last preview rather than a disappearing status.
+        if use_draft and MAX_WAIT > 0 and elapsed >= MAX_WAIT and self._draft_msg_id:
+            try:
+                timeout_msg = (
+                    f"⚠️ TIMEOUT after {MAX_WAIT}s\n\n{preview_msg}"
+                    if preview_msg
+                    else f"⚠️ TIMEOUT after {MAX_WAIT}s"
+                )
+                await self._edit_with_retry(
+                    bot, CHAT_ID, self._draft_msg_id,
+                    timeout_msg, parse_mode="HTML",
+                )
             except Exception:
                 pass
 
@@ -2751,7 +3682,10 @@ class LiteClaw:
     def _extract_response(self, capture: str, user_text: str, pre_snapshot: str = "") -> str:
         """Extract Claude's response from capture-pane.
         Primary: diff against pre_snapshot (reliable).
-        Fallback: echo matching (legacy)."""
+        Fallback: echo matching (legacy).
+
+        Note: Phase D's `_split_reasoning` is a module-level helper defined after this class.
+        """
         cleaned = clean_output(capture)
         lines = cleaned.split("\n")
 
@@ -3173,6 +4107,8 @@ class LiteClaw:
                     subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
 
         async def on_init(app):
+            # Cache bot reference for background tasks (e.g. CLI mirror)
+            self._bot_ref = app.bot
             if self._cron_jobs:
                 self._schedule_cron_jobs(app.job_queue)
                 log.info(f"Cron scheduler initialized with {len(self._cron_jobs)} job(s)")
@@ -3192,6 +4128,18 @@ class LiteClaw:
             log.info("Evolve proposal checker scheduled (every 30 min)")
             # Session recovery: deliver any missed messages from previous session
             await self._recover_pending_messages(app.bot)
+            # Start CLI mirror if enabled (config-persisted or env-default)
+            if self.mirror_on:
+                if self._mirror_task is None or self._mirror_task.done():
+                    self._mirror_task = asyncio.create_task(self._mirror_loop())
+                    log.info("Mirror loop started (mirror_on=True)")
+            # Register Telegram native command menu (overrides OpenClaw pollution)
+            await self._register_native_commands(app.bot)
+            # Periodic re-registration to resist OpenClaw gateway restarts
+            asyncio.create_task(self._native_menu_periodic())
+            # Hot-reload watcher (mtime poll every 10s)
+            if SKILLS_HOT_RELOAD:
+                asyncio.create_task(self._skills_hot_reload_loop())
 
         app = (
             Application.builder()
@@ -3212,6 +4160,8 @@ class LiteClaw:
         app.add_handler(CommandHandler("cancel", self.cmd_cancel))
         app.add_handler(CommandHandler("escape", self.cmd_escape))
         app.add_handler(CommandHandler("raw", self.cmd_raw))
+        app.add_handler(CommandHandler("mirror", self.cmd_mirror))
+        app.add_handler(CommandHandler("reasoning", self.cmd_reasoning))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("sessions", self.cmd_sessions))
         app.add_handler(CommandHandler("get", self.cmd_get))
@@ -3222,6 +4172,7 @@ class LiteClaw:
         app.add_handler(CommandHandler("cron", self.cmd_cron))
         app.add_handler(CallbackQueryHandler(self._handle_callback))
         app.add_handler(CommandHandler("evolve", self.cmd_evolve))
+        app.add_handler(CommandHandler("lcskill", self.cmd_lcskill))
         app.add_handler(MessageHandler(filters.Document.ALL, self.handle_document))
         app.add_handler(MessageHandler(filters.PHOTO, self.handle_photo))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))

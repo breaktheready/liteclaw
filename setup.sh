@@ -93,6 +93,39 @@ else
     echo "[OK] .env already configured"
 fi
 
+# 6. Summarizer (Tier 1) availability check
+#
+# LiteClaw has a 3-tier summarizer with automatic fallback:
+#   Tier 1: external OpenAI-compatible proxy (fastest, cleanest output)
+#   Tier 2: hidden Claude Code agent inside tmux (works offline, slower)
+#   Tier 3: raw terminal output (no summarization)
+#
+# The bot is fully functional at any tier, but Tier 1 gives the best UX.
+SUMMARIZER_URL=$(grep -E '^\s*SUMMARIZER_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+SUMMARIZER_URL=${SUMMARIZER_URL:-http://localhost:8080/v1}
+
+echo ""
+echo "Checking Tier 1 summarizer at ${SUMMARIZER_URL} ..."
+if curl -sf --max-time 3 "${SUMMARIZER_URL%/}/models" >/dev/null 2>&1; then
+    echo "[OK] Summarizer reachable"
+else
+    cat <<EOF
+[!] Summarizer not reachable at ${SUMMARIZER_URL}
+    LiteClaw will still run using Tier 2 (Claude Code agent) fallback.
+    For best response quality, run an OpenAI-compatible endpoint at
+    SUMMARIZER_URL. Recommended option — reuse your Claude Max subscription:
+
+      https://github.com/1rgs/claude-max-openai-proxy
+
+    Typical install:
+      git clone https://github.com/1rgs/claude-max-openai-proxy.git
+      cd claude-max-openai-proxy && docker compose up -d
+
+    Or point SUMMARIZER_URL / SUMMARIZER_MODEL in .env at any
+    OpenAI-compatible API you already have (OpenAI, Groq, local LLM, etc.).
+EOF
+fi
+
 echo ""
 echo "=== Setup Complete ==="
 echo ""

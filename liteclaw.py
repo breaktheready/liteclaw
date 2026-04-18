@@ -66,7 +66,7 @@ except ValueError:
 TMUX_TARGET = os.environ.get("TMUX_TARGET", "claude:1")
 
 # Summarizer config (local Claude proxy)
-SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://localhost:8080/v1")
+SUMMARIZER_URL = os.environ.get("SUMMARIZER_URL", "http://localhost:3456/v1")
 SUMMARIZER_MODEL = os.environ.get("SUMMARIZER_MODEL", "claude-sonnet-4-6")
 SUMMARIZER_AGENT_MODEL = os.environ.get("SUMMARIZER_AGENT_MODEL", "")  # model for Tier 2 agent
 SUMMARIZER_AGENT_SESSION = "liteclaw-summarizer"  # hidden tmux session for Tier 2

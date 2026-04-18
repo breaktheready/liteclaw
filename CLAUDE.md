@@ -56,7 +56,7 @@ CHAT_ID=<your_telegram_chat_id>
 ### Optional (with defaults)
 ```
 TMUX_TARGET=claude:1                    # tmux target pane
-SUMMARIZER_URL=http://localhost:8080/v1 # OpenAI-compatible API endpoint
+SUMMARIZER_URL=http://localhost:3456/v1 # OpenAI-compatible API endpoint
 SUMMARIZER_MODEL=claude-sonnet-4-6      # Model for Tier 1 summarization
 SUMMARIZER_AGENT_MODEL=                 # Optional Tier 2 agent model override
 SCROLLBACK_LINES=500                    # capture-pane scrollback depth
@@ -351,7 +351,8 @@ Direct `tmux send-keys -l` crashes on quotes, newlines, and special characters.
 ### Infrastructure: API Proxy
 LiteClaw's Tier 1 summarizer depends on an OpenAI-compatible API proxy.
 - If down: auto-recovery attempts `docker compose up -d`
-- Manual check: `curl -s http://localhost:8080/v1/models`
+- Manual check: `curl -s http://localhost:3456/v1/models`
+- Recommended proxy: [mattschwen/claude-max-api-proxy](https://github.com/mattschwen/claude-max-api-proxy) — Docker compose, reuses Claude Max subscription
 - **Degraded without proxy** — Tier 2/3 still work but quality drops
 
 ### Startup Sequence
@@ -413,7 +414,7 @@ print("Prompt detected:", has_prompt(result.stdout))
 
 ### Test API Proxy
 ```bash
-curl -s http://localhost:8080/v1/models
+curl -s http://localhost:3456/v1/models
 # Should return JSON with model list
 ```
 

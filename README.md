@@ -55,8 +55,9 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
 - **Telegram bot token** from [@BotFather](https://t.me/BotFather)
 - **(Recommended) OpenAI-compatible API proxy** for response summarization (Tier 1)
   - Without it, LiteClaw falls back to a hidden Claude Code agent (Tier 2) or raw output (Tier 3)
-  - Example: [claude-max-api-proxy](https://github.com/1rgs/claude-max-openai-proxy) or any OpenAI-compatible endpoint
-  - If using Docker: `docker compose up -d` in your proxy directory
+  - Recommended: [claude-max-api-proxy](https://github.com/mattschwen/claude-max-api-proxy) — reuses your Claude Max subscription, ships a `docker-compose.yml`
+  - Any OpenAI-compatible endpoint works (OpenAI, Groq, local LLM, etc.) — just point `SUMMARIZER_URL` / `SUMMARIZER_MODEL` at it
+  - The default `SUMMARIZER_URL` is `http://localhost:3456/v1` (matches the recommended proxy's default port)
 - **(Optional) Docker** — only needed if your API proxy runs in a container
 
 ---
@@ -120,7 +121,7 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 | `BOT_TOKEN` | (required) | Telegram bot token from @BotFather |
 | `CHAT_ID` | (required) | Your numeric Telegram user ID |
 | `TMUX_TARGET` | `claude:1` | Target tmux session and window (`SESSION:WINDOW.PANE`) |
-| `SUMMARIZER_URL` | `http://localhost:8080/v1` | OpenAI-compatible API endpoint for summarization |
+| `SUMMARIZER_URL` | `http://localhost:3456/v1` | OpenAI-compatible API endpoint for summarization |
 | `SUMMARIZER_MODEL` | `claude-haiku-4-5` | Model to use for response cleanup |
 | `SCROLLBACK_LINES` | `500` | Number of tmux history lines to capture per poll |
 | `INTERMEDIATE_INTERVAL` | `10` | Seconds between progress updates while Claude works |
@@ -355,7 +356,7 @@ LiteClaw does not call Claude's API directly. It controls Claude Code through tm
 LiteClaw has a 3-tier summarizer that works out of the box — no extra setup needed.
 
 **Tier 1: API Proxy** (fastest, 2-3s) — If you have an OpenAI-compatible API endpoint, set `SUMMARIZER_URL`. Options:
-- [claude-max-api-proxy](https://github.com/1mancrew/claude-max-api-proxy) — Use your Claude Max subscription
+- [claude-max-api-proxy](https://github.com/mattschwen/claude-max-api-proxy) — Use your Claude Max subscription as an OpenAI-compatible API (recommended Tier 1 summarizer)
 - [LiteLLM](https://github.com/BerriAI/litellm) — Proxy to any LLM provider
 - Any OpenAI-compatible endpoint
 

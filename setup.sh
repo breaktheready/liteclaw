@@ -102,7 +102,7 @@ fi
 #
 # The bot is fully functional at any tier, but Tier 1 gives the best UX.
 SUMMARIZER_URL=$(grep -E '^\s*SUMMARIZER_URL=' .env 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
-SUMMARIZER_URL=${SUMMARIZER_URL:-http://localhost:8080/v1}
+SUMMARIZER_URL=${SUMMARIZER_URL:-http://localhost:3456/v1}
 
 echo ""
 echo "Checking Tier 1 summarizer at ${SUMMARIZER_URL} ..."
@@ -115,11 +115,14 @@ else
     For best response quality, run an OpenAI-compatible endpoint at
     SUMMARIZER_URL. Recommended option — reuse your Claude Max subscription:
 
-      https://github.com/1rgs/claude-max-openai-proxy
+      https://github.com/mattschwen/claude-max-api-proxy
 
     Typical install:
-      git clone https://github.com/1rgs/claude-max-openai-proxy.git
-      cd claude-max-openai-proxy && docker compose up -d
+      git clone https://github.com/mattschwen/claude-max-api-proxy.git
+      cd claude-max-api-proxy && docker compose up -d
+
+    The proxy defaults to port 3456, which matches LiteClaw's default
+    SUMMARIZER_URL. If you change the port, update .env accordingly.
 
     Or point SUMMARIZER_URL / SUMMARIZER_MODEL in .env at any
     OpenAI-compatible API you already have (OpenAI, Groq, local LLM, etc.).

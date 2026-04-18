@@ -122,7 +122,7 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 | `CHAT_ID` | (required) | Your numeric Telegram user ID |
 | `TMUX_TARGET` | `claude:1` | Target tmux session and window (`SESSION:WINDOW.PANE`) |
 | `SUMMARIZER_URL` | `http://localhost:3456/v1` | OpenAI-compatible API endpoint for summarization |
-| `SUMMARIZER_MODEL` | `claude-haiku-4-5` | Model to use for response cleanup |
+| `SUMMARIZER_MODEL` | `claude-sonnet-4-6` | Model to use for response cleanup |
 | `SCROLLBACK_LINES` | `500` | Number of tmux history lines to capture per poll |
 | `INTERMEDIATE_INTERVAL` | `10` | Seconds between progress updates while Claude works |
 | `STAGING_DIR` | `~/liteclaw-files` | Directory where uploaded files are saved on the server |

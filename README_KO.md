@@ -117,7 +117,7 @@ python3 liteclaw.py
 | `CHAT_ID` | (필수) | 본인의 텔레그램 채팅 ID |
 | `TMUX_TARGET` | `claude:1` | tmux 타겟 pane (형식: `세션:윈도우.pane`) |
 | `SUMMARIZER_URL` | `http://localhost:3456/v1` | OpenAI 호환 API 엔드포인트 |
-| `SUMMARIZER_MODEL` | `claude-haiku-4-5` | 요약에 사용할 모델 |
+| `SUMMARIZER_MODEL` | `claude-sonnet-4-6` | 요약에 사용할 모델 |
 | `SCROLLBACK_LINES` | `500` | tmux에서 캡처할 줄 수 |
 | `INTERMEDIATE_INTERVAL` | `10` | 진행 상황 업데이트 간격 (초) |
 | `STAGING_DIR` | `~/liteclaw-files` | 파일 업로드 디렉토리 |

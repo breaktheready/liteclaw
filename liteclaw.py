@@ -54,8 +54,15 @@ from telegram.ext import (
 
 load_dotenv()
 
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = int(os.environ["CHAT_ID"])
+# Config values are loaded leniently so `import liteclaw` works even with an
+# unconfigured/placeholder .env (e.g. right after `setup.sh`, or when a test
+# harness imports the module to smoke-check). Actual validation happens in
+# main() before the bot starts.
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+try:
+    CHAT_ID = int(os.environ.get("CHAT_ID", "0"))
+except ValueError:
+    CHAT_ID = 0
 TMUX_TARGET = os.environ.get("TMUX_TARGET", "claude:1")
 
 # Summarizer config (local Claude proxy)
@@ -4284,6 +4291,11 @@ def _is_binary(path: Path) -> bool:
 
 def main():
     """Entry point for the liteclaw command."""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Error: BOT_TOKEN and CHAT_ID must be set in .env")
+        print("  BOT_TOKEN  - get from @BotFather on Telegram (/newbot)")
+        print("  CHAT_ID    - get from @userinfobot on Telegram")
+        sys.exit(1)
     session_name = TMUX_TARGET.split(":")[0]
     r = subprocess.run(
         ["tmux", "has-session", "-t", session_name],

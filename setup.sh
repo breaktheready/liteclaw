@@ -29,20 +29,30 @@ if ! command -v tmux &>/dev/null; then
 fi
 echo "[OK] tmux $(tmux -V)"
 
-# 2. Check Python 3.10+
-if ! command -v python3 &>/dev/null; then
-    echo "[ERROR] Python 3 not found. Please install Python 3.10 or higher."
-    echo "  Ubuntu/Debian: sudo apt install python3 python3-venv"
-    echo "  macOS:         brew install python3"
+# 2. Find Python 3.10+ (prefer newer versions, fall back through named interpreters)
+# On macOS, `python3` often resolves to system 3.9 even when brew python@3.12 is installed,
+# because brew's formula only provides versioned binaries (python3.12) without a generic
+# python3 symlink. Search for versioned interpreters first.
+PYTHON_BIN=""
+for bin in python3.13 python3.12 python3.11 python3.10 python3; do
+    if command -v "$bin" &>/dev/null; then
+        ver=$("$bin" -c "import sys; print(sys.version_info.major*100+sys.version_info.minor)" 2>/dev/null)
+        if [ -n "$ver" ] && [ "$ver" -ge 310 ]; then
+            PYTHON_BIN=$(command -v "$bin")
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_BIN" ]; then
+    echo "[ERROR] Python 3.10+ not found. Please install:"
+    echo "  Ubuntu/Debian: sudo apt install python3.12 python3.12-venv"
+    echo "  macOS:         brew install python@3.12"
+    echo "  Fedora/RHEL:   sudo dnf install python3.12"
     exit 1
 fi
-PY_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
-PY_MINOR=$(python3 -c "import sys; print(sys.version_info.minor)")
-if [ "$PY_MINOR" -lt 10 ]; then
-    echo "[ERROR] Python 3.10+ required, found Python $PY_VER"
-    exit 1
-fi
-echo "[OK] Python $PY_VER"
+PY_VER=$("$PYTHON_BIN" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+echo "[OK] Python $PY_VER ($PYTHON_BIN)"
 
 # 3. Check Claude Code CLI
 if command -v claude &>/dev/null; then
@@ -60,7 +70,7 @@ cd "$SCRIPT_DIR"
 if [ ! -d ".venv" ]; then
     echo ""
     echo "Creating virtual environment..."
-    python3 -m venv .venv
+    "$PYTHON_BIN" -m venv .venv
 fi
 echo "Installing dependencies..."
 .venv/bin/pip install -q -r requirements.txt

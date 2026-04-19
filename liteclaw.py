@@ -533,6 +533,48 @@ Telegram formatting rules:
 
 
 # =============================================================================
+# Cron helper (Unix-standard day-of-week semantics)
+# =============================================================================
+
+# APScheduler 3.x CronTrigger.from_crontab() treats numeric day-of-week
+# with APScheduler's internal index (0=Mon, 6=Sun) rather than Unix cron
+# (0/7=Sun, 1=Mon, ..., 6=Sat). Result: "1-5" means Tue-Sat, not Mon-Fri.
+# Observed on 2026-04-18 (Sat) when weekday-only crons fired.
+_DOW_NAMES = ("sun", "mon", "tue", "wed", "thu", "fri", "sat")
+
+
+def _unix_dow_to_name(tok: str) -> str:
+    return _DOW_NAMES[int(tok) % 7]
+
+
+def _translate_dow_part(part: str) -> str:
+    part = part.strip()
+    if not part or part == "*" or any(c.isalpha() for c in part):
+        return part
+    if "/" in part:
+        base, step = part.split("/", 1)
+        return f"{_translate_dow_part(base)}/{step}"
+    if "-" in part:
+        a, b = part.split("-", 1)
+        return f"{_unix_dow_to_name(a)}-{_unix_dow_to_name(b)}"
+    return _unix_dow_to_name(part)
+
+
+def build_cron_trigger(cron_expr: str, tz):
+    """Build APScheduler CronTrigger with Unix-standard weekday indexing."""
+    from apscheduler.triggers.cron import CronTrigger
+    parts = cron_expr.split()
+    if len(parts) != 5:
+        raise ValueError(f"Cron expression must have 5 fields: {cron_expr!r}")
+    minute, hour, day, month, dow = parts
+    dow_translated = ",".join(_translate_dow_part(p) for p in dow.split(","))
+    return CronTrigger(
+        minute=minute, hour=hour, day=day, month=month,
+        day_of_week=dow_translated, timezone=tz,
+    )
+
+
+# =============================================================================
 # Dashboard
 # =============================================================================
 
@@ -1268,14 +1310,12 @@ class LiteClaw:
 
     def _schedule_cron_jobs(self, job_queue):
         """Register all enabled cron jobs with the bot's JobQueue."""
-        from apscheduler.triggers.cron import CronTrigger
-
         for job in self._cron_jobs:
             if not job.get("enabled", True):
                 continue
             try:
                 tz = job.get("tz", "Asia/Seoul")
-                trigger = CronTrigger.from_crontab(job["cron_expr"], timezone=tz)
+                trigger = build_cron_trigger(job["cron_expr"], tz)
                 job_queue.run_custom(
                     callback=self._run_cron_job,
                     job_kwargs={
@@ -2069,8 +2109,7 @@ class LiteClaw:
 
             # Validate cron expression
             try:
-                from apscheduler.triggers.cron import CronTrigger
-                CronTrigger.from_crontab(cron_expr, timezone="Asia/Seoul")
+                build_cron_trigger(cron_expr, "Asia/Seoul")
             except Exception as e:
                 await update.message.reply_text(f"Invalid cron expression: {e}")
                 return
@@ -2092,8 +2131,7 @@ class LiteClaw:
             # Register with scheduler if running
             if hasattr(ctx, "job_queue") and ctx.job_queue:
                 try:
-                    from apscheduler.triggers.cron import CronTrigger
-                    trigger = CronTrigger.from_crontab(cron_expr, timezone="Asia/Seoul")
+                    trigger = build_cron_trigger(cron_expr, "Asia/Seoul")
                     ctx.job_queue.run_custom(
                         callback=self._run_cron_job,
                         job_kwargs={"trigger": trigger, "id": f"cron-{job_id}", "replace_existing": True},
@@ -2151,8 +2189,7 @@ class LiteClaw:
             if ctx.job_queue:
                 if enabled:
                     try:
-                        from apscheduler.triggers.cron import CronTrigger
-                        trigger = CronTrigger.from_crontab(job["cron_expr"], timezone=job.get("tz", "Asia/Seoul"))
+                        trigger = build_cron_trigger(job["cron_expr"], job.get("tz", "Asia/Seoul"))
                         ctx.job_queue.run_custom(
                             callback=self._run_cron_job,
                             job_kwargs={"trigger": trigger, "id": f"cron-{job_id}", "replace_existing": True},

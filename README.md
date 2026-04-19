@@ -60,6 +60,14 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
   - The default `SUMMARIZER_URL` is `http://localhost:3456/v1` (matches the recommended proxy's default port)
 - **(Optional) Docker** — only needed if your API proxy runs in a container
 
+### Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| Linux | ✅ Primary target | Docker proxy works directly |
+| macOS | ✅ Supported | Run the proxy as a **LaunchAgent** instead of Docker — Docker can't read the keychain. See [MAC-OPS.md](./MAC-OPS.md). Use [`start.sh`](./start.sh) to launch Claude Code + LiteClaw together. |
+| Windows | ⚠️ Not native | LiteClaw depends on tmux. Run under **WSL** (Ubuntu/Debian) and follow the Linux path. Native PowerShell/cmd is not supported. |
+
 ---
 
 ## Quick Start
@@ -109,6 +117,17 @@ python3 liteclaw.py
 ```
 
 Send `/start` to your Telegram bot to confirm it is working.
+
+### One-command launch (`start.sh`)
+
+Once `.env` is configured, you can start both Claude Code (in tmux `claude`) and LiteClaw together:
+
+```bash
+bash ./start.sh           # both services in detached tmux sessions
+bash ./start.sh --attach  # ... and attach to the claude pane
+```
+
+The script is idempotent — re-running it is a no-op when both are already up. Order is enforced (Claude Code first, prompt-readiness wait, then LiteClaw) so the bridge always has a target. The "trust this folder" dialog is auto-accepted.
 
 ---
 

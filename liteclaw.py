@@ -3878,20 +3878,33 @@ class LiteClaw:
             return False
 
     async def _recover_proxy(self) -> bool:
-        """Try to restart max-api-proxy Docker container."""
+        """Try to restart the API proxy. macOS uses LaunchAgent; Linux uses Docker compose."""
         log.warning("Attempting to restart max-api-proxy...")
         try:
-            r = subprocess.run(
-                ["docker", "compose", "up", "-d"],
-                cwd=os.environ.get("PROXY_DIR", os.path.expanduser("~/max_api_proxy")),
-                capture_output=True, text=True, timeout=30,
-            )
+            if sys.platform == "darwin":
+                # Docker on macOS cannot access the keychain where Claude CLI stores OAuth
+                # tokens, so the proxy runs as a LaunchAgent instead. See MAC-OPS.md.
+                label = f"gui/{os.getuid()}/com.claude-max-api-proxy"
+                r = subprocess.run(
+                    ["launchctl", "kickstart", "-k", label],
+                    capture_output=True, text=True, timeout=15,
+                )
+                settle_s = 5
+            else:
+                r = subprocess.run(
+                    ["docker", "compose", "up", "-d"],
+                    cwd=os.environ.get("PROXY_DIR", os.path.expanduser("~/max_api_proxy")),
+                    capture_output=True, text=True, timeout=30,
+                )
+                settle_s = 3
             if r.returncode == 0:
-                await asyncio.sleep(3)
+                await asyncio.sleep(settle_s)
                 if await self._probe_api():
                     log.info("max-api-proxy recovered successfully")
                     await self._notify_recovery("max-api-proxy restarted")
                     return True
+            else:
+                log.warning(f"Proxy recovery returncode={r.returncode} stderr={r.stderr[:200]}")
         except Exception as e:
             log.warning(f"Proxy recovery failed: {e}")
         return False

@@ -250,9 +250,10 @@ Ensures response delivery even when infrastructure is degraded.
 ## Auto-Recovery Mechanisms
 
 ### API Proxy Recovery
-- On Tier 1 failure: runs `docker compose up -d` in the proxy directory
+- On Tier 1 failure: runs `docker compose up -d` in the proxy directory (Linux hosts)
 - Retries connection after restart
 - Notifies user via Telegram on successful recovery
+- **macOS note**: proxy runs as LaunchAgent, not Docker — recovery would no-op. launchd's `KeepAlive` handles crash restarts automatically. See [MAC-OPS.md](./MAC-OPS.md).
 
 ### Session Auth Recovery (401)
 - Detects "401" + auth keywords in tmux pane output
@@ -350,10 +351,11 @@ Direct `tmux send-keys -l` crashes on quotes, newlines, and special characters.
 
 ### Infrastructure: API Proxy
 LiteClaw's Tier 1 summarizer depends on an OpenAI-compatible API proxy.
-- If down: auto-recovery attempts `docker compose up -d`
+- If down: auto-recovery attempts `docker compose up -d` (Linux/auto-recovery path only)
 - Manual check: `curl -s http://localhost:3456/v1/models`
-- Recommended proxy: [mattschwen/claude-max-api-proxy](https://github.com/mattschwen/claude-max-api-proxy) — Docker compose, reuses Claude Max subscription
+- Recommended proxy: [mattschwen/claude-max-api-proxy](https://github.com/mattschwen/claude-max-api-proxy) — reuses Claude Max subscription
 - **Degraded without proxy** — Tier 2/3 still work but quality drops
+- **macOS**: Docker cannot access the user keychain where Claude stores OAuth tokens. Run the proxy as a LaunchAgent instead — see [MAC-OPS.md](./MAC-OPS.md).
 
 ### Startup Sequence
 

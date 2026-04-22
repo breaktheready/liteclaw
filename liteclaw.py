@@ -2468,6 +2468,45 @@ class LiteClaw:
         mode = "ON (raw output)" if self.raw_mode else "OFF (summarized)"
         await update.message.reply_text(f"Raw mode: {mode}")
 
+    async def cmd_tell_summarizer(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        """Runtime control over the summarizer system prompt.
+
+        Usage:
+          /tell-summarizer <instruction>   — append instruction (persists in-memory)
+          /tell-summarizer show            — show the current extra instructions
+          /tell-summarizer clear           — clear all extra instructions
+        """
+        if not self._auth(update):
+            return
+        args = ctx.args or []
+        joined = " ".join(args).strip()
+        current = getattr(self, "_summarizer_extra_prompt", "").strip()
+        if not args or joined.lower() == "show":
+            body = current or "(empty — no extra instructions active)"
+            await update.message.reply_text(
+                f"📝 *Summarizer runtime instructions*\n\n```\n{body}\n```\n\n"
+                "Usage:\n"
+                "`/tell-summarizer <instruction>` — append\n"
+                "`/tell-summarizer clear` — wipe\n"
+                "`/tell-summarizer show` — this view",
+                parse_mode="Markdown",
+            )
+            return
+        if joined.lower() == "clear":
+            self._summarizer_extra_prompt = ""
+            self._log_event("summarizer_tell", "cleared")
+            await update.message.reply_text("📝 Summarizer extra instructions cleared.")
+            return
+        # Append the new instruction on its own line (multiple can accumulate)
+        new = (current + "\n" + joined).strip() if current else joined
+        self._summarizer_extra_prompt = new
+        self._log_event("summarizer_tell", f"appended: {joined[:200]}")
+        await update.message.reply_text(
+            f"📝 Summarizer now also honors:\n```\n{joined}\n```\n"
+            f"(Total extra length: {len(new)} chars. Use `/tell-summarizer clear` to reset.)",
+            parse_mode="Markdown",
+        )
+
     async def cmd_mirror(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         """Toggle CLI mirror — forwards direct terminal activity to Telegram."""
         if not self._auth(update):
@@ -4930,11 +4969,20 @@ class LiteClaw:
             log.info("Skipping summarize: too short")
             return raw_output
 
-        # Tier 1: API proxy
+        # Tier 1: API proxy. Append any runtime extra instruction the user set
+        # via /tell-summarizer so they can tune behavior without code edits.
+        system_prompt = SUMMARIZE_PROMPT
+        extra = getattr(self, "_summarizer_extra_prompt", "").strip()
+        if extra:
+            system_prompt = (
+                SUMMARIZE_PROMPT
+                + "\n\nUSER-PROVIDED RUNTIME INSTRUCTIONS (from /tell-summarizer — honor these):\n"
+                + extra
+            )
         tier1_payload = {
             "model": SUMMARIZER_MODEL,
             "messages": [
-                {"role": "system", "content": SUMMARIZE_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": (
                     f"[REFORMAT TASK] Clean up the following terminal output for Telegram delivery.\n"
                     f"Context — the user asked: \"{user_question}\"\n\n"
@@ -5068,6 +5116,8 @@ class LiteClaw:
         app.add_handler(CommandHandler("cancel", self.cmd_cancel))
         app.add_handler(CommandHandler("escape", self.cmd_escape))
         app.add_handler(CommandHandler("raw", self.cmd_raw))
+        app.add_handler(CommandHandler("tell_summarizer", self.cmd_tell_summarizer))
+        app.add_handler(CommandHandler("tellsum", self.cmd_tell_summarizer))  # short alias
         app.add_handler(CommandHandler("mirror", self.cmd_mirror))
         app.add_handler(CommandHandler("reasoning", self.cmd_reasoning))
         app.add_handler(CommandHandler("model", self.cmd_model))

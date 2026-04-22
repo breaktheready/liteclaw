@@ -1,5 +1,11 @@
 # LiteClaw
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#플랫폼-지원)
+[![CI](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/breaktheready/liteclaw?style=social)](https://github.com/breaktheready/liteclaw/stargazers)
+
 텔레그램으로 Claude Code CLI를 원격 제어. 추가 API 키 불필요.
 
 [English](README.md)

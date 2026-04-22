@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main, feat/*]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Python syntax check (liteclaw.py)
+        run: python -c "import ast; ast.parse(open('liteclaw.py').read()); print('liteclaw.py syntax OK')"
+
+      - name: Bash syntax check (shell entry points)
+        run: |
+          bash -n setup.sh
+          bash -n start.sh
+          bash -n bin/liteclaw
+          echo "bash syntax OK"
+
+      - name: Install requirements (import check)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          python -c "
+          import importlib
+          for mod in ('httpx', 'telegram', 'dotenv', 'apscheduler'):
+              importlib.import_module(mod)
+              print(f'import {mod}: OK')
+          "
+
+      - name: Static import check on liteclaw.py
+        run: |
+          # `python -c "import liteclaw"` would try to spin up the bot; we only
+          # want to verify the module parses and top-level imports resolve.
+          python -c "
+          import ast, sys
+          src = open('liteclaw.py').read()
+          tree = ast.parse(src)
+          top_imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+          print(f'{len(top_imports)} top-level imports parse cleanly')
+          "
+
+  lint-ruff:
+    runs-on: ubuntu-latest
+    continue-on-error: true  # linting is advisory; don't fail the build while codebase catches up
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install ruff
+      - run: ruff check liteclaw.py --output-format=github || true

@@ -1,5 +1,11 @@
 # LiteClaw
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#platform-support)
+[![CI](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/breaktheready/liteclaw?style=social)](https://github.com/breaktheready/liteclaw/stargazers)
+
 Control Claude Code CLI remotely via Telegram. No API key needed.
 
 [한국어](README_KO.md)

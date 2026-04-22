@@ -29,6 +29,54 @@ if ! command -v tmux &>/dev/null; then
 fi
 echo "[OK] tmux $(tmux -V)"
 
+# 1b. Ensure ~/.tmux.conf has mouse + scrollback so users can wheel-scroll the
+# claude/liteclaw panes (default tmux disables mouse and caps history at 2000).
+TMUX_CONF="$HOME/.tmux.conf"
+TMUX_ADDED=0
+ensure_tmux_line() {
+    local line="$1" key="$2"
+    if [ -f "$TMUX_CONF" ] && grep -qE "^\s*set(-option)?\s+-g\s+${key}\b" "$TMUX_CONF"; then
+        return
+    fi
+    printf '%s\n' "$line" >> "$TMUX_CONF"
+    TMUX_ADDED=1
+}
+ensure_tmux_line "set -g mouse on" "mouse"
+ensure_tmux_line "set -g history-limit 50000" "history-limit"
+if [ "$TMUX_ADDED" -eq 1 ]; then
+    echo "[OK] Updated $TMUX_CONF (mouse on, history-limit 50000)"
+    # Apply to any running sessions so the change takes effect immediately.
+    if tmux list-sessions >/dev/null 2>&1; then
+        tmux source-file "$TMUX_CONF" >/dev/null 2>&1 || true
+    fi
+else
+    echo "[OK] tmux mouse/history config already present"
+fi
+
+# 1c. Install global `liteclaw` CLI symlink in ~/.local/bin (idempotent).
+# Symlink (not copy) so subsequent repo updates take effect without re-install.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+DISPATCHER="$SCRIPT_DIR/bin/liteclaw"
+LINK_DIR="$HOME/.local/bin"
+LINK="$LINK_DIR/liteclaw"
+if [ -x "$DISPATCHER" ]; then
+    mkdir -p "$LINK_DIR"
+    if [ -L "$LINK" ] && [ "$(readlink "$LINK")" = "$DISPATCHER" ]; then
+        echo "[OK] liteclaw CLI already linked at $LINK"
+    else
+        ln -sfn "$DISPATCHER" "$LINK"
+        echo "[OK] Linked liteclaw CLI: $LINK -> $DISPATCHER"
+    fi
+    case ":$PATH:" in
+        *":$LINK_DIR:"*) ;;
+        *) echo "[!] $LINK_DIR is not in PATH — add to your shell rc:"
+           echo "      export PATH=\"\$HOME/.local/bin:\$PATH\""
+           ;;
+    esac
+else
+    echo "[!] $DISPATCHER not executable — skipping CLI symlink"
+fi
+
 # 2. Find Python 3.10+ (prefer newer versions, fall back through named interpreters)
 # On macOS, `python3` often resolves to system 3.9 even when brew python@3.12 is installed,
 # because brew's formula only provides versioned binaries (python3.12) without a generic

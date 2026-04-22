@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# liteclaw — global CLI dispatcher.
+# Resolves the LiteClaw repo via its own location (or $LITECLAW_HOME) and
+# delegates to start.sh / tmux / log files.
+#
+# Usage:
+#   liteclaw start [--attach]   bring up Claude Code + LiteClaw
+#   liteclaw stop               tear down both tmux sessions
+#   liteclaw restart            stop + start
+#   liteclaw status             session + process + dashboard summary
+#   liteclaw logs [-f]          tail /tmp/liteclaw_run.log
+#   liteclaw attach             tmux attach -t claude
+#   liteclaw help               this help
+
+set -euo pipefail
+
+# Resolve REPO root: $LITECLAW_HOME wins, otherwise infer from this script's path
+# (handles symlink in ~/.local/bin/liteclaw → repo/bin/liteclaw).
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    LINK_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+    SOURCE=$(readlink "$SOURCE")
+    [[ $SOURCE != /* ]] && SOURCE="$LINK_DIR/$SOURCE"
+done
+SCRIPT_DIR=$(cd -P "$(dirname "$SOURCE")" && pwd)
+REPO="${LITECLAW_HOME:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+LOG="/tmp/liteclaw_run.log"
+
+[ -f "$REPO/liteclaw.py" ] || { echo "✗ liteclaw.py not found under $REPO (set LITECLAW_HOME)" >&2; exit 1; }
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+    start)
+        exec bash "$REPO/start.sh" "$@"
+        ;;
+
+    stop)
+        stopped=0
+        if tmux has-session -t liteclaw 2>/dev/null; then
+            tmux kill-session -t liteclaw && echo "✓ killed tmux 'liteclaw'"
+            stopped=1
+        fi
+        if pgrep -f "python.*liteclaw.py" >/dev/null; then
+            pkill -f "python.*liteclaw.py" && echo "✓ killed liteclaw.py process(es)"
+            stopped=1
+        fi
+        if tmux has-session -t claude 2>/dev/null; then
+            tmux kill-session -t claude && echo "✓ killed tmux 'claude'"
+            stopped=1
+        fi
+        [ "$stopped" -eq 0 ] && echo "(nothing was running)"
+        ;;
+
+    restart)
+        "$0" stop || true
+        sleep 1
+        exec "$0" start "$@"
+        ;;
+
+    status)
+        echo "REPO:    $REPO"
+        echo
+        echo "tmux sessions:"
+        if tmux list-sessions 2>/dev/null | grep -E '^(claude|liteclaw):'; then :; else
+            echo "  (none of claude/liteclaw running)"
+        fi
+        echo
+        pid=$(pgrep -f "python.*liteclaw.py" | head -1 || true)
+        if [ -n "$pid" ]; then
+            echo "liteclaw.py: running (pid $pid)"
+        else
+            echo "liteclaw.py: not running"
+        fi
+        # Dashboard port (default 7777, configurable via .env). Tolerate missing
+        # key / missing .env without tripping `set -e` + pipefail.
+        port=""
+        if [ -f "$REPO/.env" ]; then
+            port=$( { grep -E '^DASHBOARD_PORT=' "$REPO/.env" || true; } | head -1 | cut -d= -f2- | tr -d '"' | tr -d "'" | xargs)
+        fi
+        port=${port:-7777}
+        if [ "$port" != "0" ] && lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; then
+            echo "dashboard:   listening on :$port"
+        else
+            echo "dashboard:   (port $port not listening)"
+        fi
+        echo
+        echo "log:     $LOG"
+        ;;
+
+    logs)
+        [ -f "$LOG" ] || { echo "(no log yet at $LOG)"; exit 0; }
+        if [ "${1:-}" = "-f" ]; then
+            exec tail -f "$LOG"
+        else
+            exec tail -n 80 "$LOG"
+        fi
+        ;;
+
+    attach)
+        if tmux has-session -t claude 2>/dev/null; then
+            exec tmux attach -t claude
+        else
+            echo "✗ no 'claude' tmux session — run 'liteclaw start' first" >&2
+            exit 1
+        fi
+        ;;
+
+    help|-h|--help)
+        sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+
+    *)
+        echo "unknown command: $cmd" >&2
+        echo "try: liteclaw help" >&2
+        exit 2
+        ;;
+esac

@@ -94,6 +94,34 @@ STAGING_DIR = Path(os.environ.get("STAGING_DIR", os.path.expanduser("~/liteclaw-
 HISTORY_FILE = Path(os.environ.get("HISTORY_FILE", os.path.expanduser("~/.liteclaw-history.jsonl")))
 HISTORY_RECALL_LIMIT = int(os.environ.get("HISTORY_RECALL_LIMIT", "50"))  # max entries for /recall
 
+# OpenClaw-style memory layout: per-day transcripts + per-day markdown summaries
+# + rolling strategic compact + synthesized startup primer.
+LITECLAW_DIR = Path(os.environ.get("LITECLAW_DIR", os.path.expanduser("~/.liteclaw")))
+LITECLAW_TRANSCRIPTS = LITECLAW_DIR / "transcripts"
+LITECLAW_MEMORY = LITECLAW_DIR / "memory"
+LITECLAW_STRATEGIC = LITECLAW_MEMORY / "strategic.md"
+LITECLAW_PRIMER = LITECLAW_DIR / "primer.md"
+LITECLAW_SESSIONS = LITECLAW_DIR / "sessions.json"
+
+# Boot notification (sent to Telegram once after the bot is fully initialized)
+BOOT_NOTIFY = os.environ.get("BOOT_NOTIFY", "1").lower() not in ("0", "false", "no", "off")
+
+# Claude Code working directory (where start.sh launches claude). Used to
+# locate ~/.claude/projects/<encoded-cwd>/ for resume-state detection.
+CLAUDE_CWD = Path(os.environ.get("CLAUDE_CWD", os.path.expanduser("~")))
+PRIMER_RECENT_TURNS = int(os.environ.get("PRIMER_RECENT_TURNS", "20"))
+
+# JSONL-based response extraction: reads Claude Code's own session log at
+# ~/.claude/projects/<encoded-cwd>/<liteclaw_session_id>.jsonl for clean,
+# structured responses instead of scraping the tmux pane (which leaks TUI
+# chrome like "Thinking (Crystalizing)" and truncates long answers at the
+# scroll-back boundary). Setting USE_JSONL_RESPONSE=0 disables this path.
+USE_JSONL_RESPONSE = os.environ.get("USE_JSONL_RESPONSE", "1").lower() not in ("0", "false", "no", "off")
+# Suppress mid-poll status edits while waiting for the final response — they
+# were the source of the "Thinking (Crystalizing)" garbled messages on
+# Telegram. Users can re-enable via SHOW_POLLING_STATUS=1 for debugging.
+SHOW_POLLING_STATUS = os.environ.get("SHOW_POLLING_STATUS", "0").lower() not in ("0", "false", "no", "off")
+
 # v0.5.0 UX Overhaul — OpenClaw/Hermes-inspired
 # F1 CLI Mirror
 MIRROR_ENABLED = os.environ.get("MIRROR_ENABLED", "false").lower() == "true"
@@ -299,11 +327,16 @@ _ACTIVITY_LABELS = (
     "|Misting|Expanding|Parsing|Crafting|Focusing|Wondering|Pondering"
     "|Transfiguring"
 )
-# Primary: spinner char + any word = activity (future-proof against new labels)
-# Fallback: explicit label list kept for documentation/reference
-_SPINNER_CHARS = r"[✻✶✽✢·●*◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
+# Spinner + capitalized word = activity. The spinner must sit at line start
+# (after optional whitespace) — otherwise Claude Code's permanent UI chrome
+# triggers false positives like "Opus 4.7 (1M context) · Claude Max" and
+# "[✻] … · Share Claude Code…", which used to keep is_idle_prompt() returning
+# False forever and hang cron jobs at the 120s busy-wait.
+# Middle dot `·` and `*` are excluded because they are routine separators, not
+# actual spinner frames used by Claude Code.
+_SPINNER_CHARS = r"[✻✶✽✢●◐◑◒◓⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]"
 _ACTIVITY_PATTERNS = re.compile(
-    rf"{_SPINNER_CHARS}\s*[A-Z][a-z]{{2,}}"   # spinner + capitalized word (e.g. ✢ Transfiguring)
+    rf"^\s*{_SPINNER_CHARS}\s+[A-Z][a-z]{{2,}}"   # line-anchored: ✢ Transfiguring
     r"|\(thinking\)"
 )
 
@@ -519,6 +552,20 @@ Reformatting rules:
 - Respond in the same language as the user's question
 - If the output contains an error, highlight it clearly
 - Keep it concise but NEVER drop important content — completeness over brevity
+
+PRESERVE-AS-IS (never compress or drop):
+- Numbered or lettered option lists presented for the user to choose from.
+  Examples:
+    "1. …  2. …  3. …"
+    "A) …  B) …  C) …"
+    "**B** — …  **C** — …  **D** — …"
+  If the original asks "B/C/D 중 뭘로?", "which one?", "번호 골라", "pick one",
+  "선택해줘", "choose", etc., keep EVERY option line verbatim. Dropping the
+  option descriptions makes the message unanswerable via Telegram.
+- Explicit questions directed at the user ("...할까요?", "which should I …?",
+  "가? 아니면 …?"). Keep them intact.
+- Any line that starts with a choice marker ("[A]", "(B)", "1)", "- A:", etc.)
+  within a section that is clearly a choice menu.
 
 Telegram formatting rules:
 - NO markdown tables (|---|) — use bullet points: "항목: 설명" or "항목 → 설명"
@@ -868,6 +915,13 @@ class LiteClaw:
         self._load_cron_jobs()
         # Session recovery state file
         self._state_file = Path(__file__).resolve().parent / ".liteclaw_state.json"
+        # Cached LiteClaw-owned session UUID (for tagging transcript entries
+        # and scoping /recall session). Refreshed at startup and whenever
+        # sessions.json changes. `None` if no id allocated yet.
+        self._current_session_id: str | None = self._load_current_session_id()
+        # Phase A: jsonl-based response extraction state.
+        self._jsonl_offset: int = 0
+        self._skip_summarizer_once: bool = False
 
     def _load_config(self):
         """Load persisted runtime toggles from ~/.liteclaw/config.json."""
@@ -1359,26 +1413,60 @@ class LiteClaw:
                      f"cd {project} && claude --dangerously-skip-permissions", "Enter"],
                     check=True,
                 )
-                # Wait for Claude Code prompt
-                for _ in range(30):
+                # Wait for Claude Code prompt, auto-accepting the trust dialog
+                # that Claude shows on first launch in a new cwd. Without this,
+                # crons that run in unattended project dirs hang on "Do you
+                # trust the files in this folder?" and time out at 120s.
+                trust_accepted = False
+                for _ in range(45):
                     await asyncio.sleep(1)
                     try:
-                        content = capture_pane(session_name, lines=10)
-                        if has_prompt(content):
-                            break
+                        content = capture_pane(session_name, lines=20)
                     except RuntimeError:
-                        pass
+                        continue
+                    if not trust_accepted and re.search(
+                        r"Yes, I trust|Do you trust the files|Trust the files in this folder",
+                        content,
+                    ):
+                        log.info(f"Cron '{job_id}': trust prompt detected, sending Enter")
+                        subprocess.run(["tmux", "send-keys", "-t", session_name, "Enter"], check=False)
+                        trust_accepted = True
+                        await asyncio.sleep(2)
+                        continue
+                    if has_prompt(content):
+                        break
                 else:
-                    raise TimeoutError("Claude Code prompt not detected after 30s")
+                    raise TimeoutError("Claude Code prompt not detected after 45s")
 
-            # Wait if session is busy
-            for _ in range(60):  # max 60s wait
+            # Wait for the cron's claude session to settle before sending.
+            # Prefer is_idle_prompt (strict: prompt + no spinner) but fall back
+            # to has_prompt + stable pane content when the banner / proxy load
+            # keeps a faint spinner lingering. Without the fallback cron jobs
+            # that launch Claude Code fresh on a busy host fail with
+            # "Session busy for 120s" even though the pane is obviously ready.
+            idle = False
+            prev_pane = ""
+            stable_prompt = 0  # consecutive polls where a prompt is visible & stable
+            for i in range(150):  # 300s total
                 pane = capture_pane(session_name, lines=15)
                 if is_idle_prompt(pane):
+                    idle = True
+                    break
+                if has_prompt(pane) and pane == prev_pane:
+                    stable_prompt += 1
+                else:
+                    stable_prompt = 0
+                prev_pane = pane
+                # 10 consecutive matching polls × 2s = 20s of prompt-visible
+                # stability is a strong signal the pane is ready even if some
+                # chrome glyph is still being interpreted as activity.
+                if stable_prompt >= 10:
+                    log.info(f"Cron '{job_id}': proceeding on stable-prompt fallback after {(i + 1) * 2}s")
+                    idle = True
                     break
                 await asyncio.sleep(2)
-            else:
-                raise TimeoutError("Session busy for 120s, giving up")
+            if not idle:
+                raise TimeoutError("Session busy for 300s, giving up")
 
             # Send the message
             message = job["message"]
@@ -1448,15 +1536,70 @@ class LiteClaw:
             job["last_run"] = datetime.now(ZoneInfo(job.get("tz", "Asia/Seoul"))).isoformat()
             job["last_status"] = f"error: {e}"
             self._save_cron_jobs()
+            # Persist a forensic record for later review. Captures the tmux pane
+            # so we can tell whether the failure was a trust prompt, auth loop,
+            # infinite spinner, etc. without needing live reproduction.
+            try:
+                self._log_cron_error(job_id, job, e, session_name)
+            except Exception as log_exc:
+                log.warning(f"Could not persist cron error capture: {log_exc}")
             try:
                 await bot.send_message(
                     chat_id=CHAT_ID,
-                    text=f"❌ Cron '{job_id}' failed: {e}",
+                    text=f"❌ Cron '{job_id}' failed: {e}\n(captured → ~/.liteclaw/cron-error-capture.md)",
                 )
             except Exception:
                 pass
         finally:
             self._cron_running.discard(job_id)
+
+    def _log_cron_error(self, job_id: str, job: dict, exc: Exception, session_name: str):
+        """Append a forensic markdown entry for a failed cron job."""
+        path = LITECLAW_DIR / "cron-error-capture.md"
+        try:
+            LITECLAW_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return
+        ts = datetime.now(ZoneInfo(job.get("tz", "Asia/Seoul"))).isoformat(timespec="seconds")
+        # Pane snapshot (last 60 lines). Best-effort — the session may have
+        # been killed already or never created.
+        pane = "(no pane captured)"
+        try:
+            r = subprocess.run(
+                ["tmux", "capture-pane", "-t", session_name, "-p", "-S", "-60"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                pane = r.stdout.rstrip() or "(pane empty)"
+        except Exception:
+            pass
+        header_exists = path.exists() and path.stat().st_size > 0
+        parts = []
+        if not header_exists:
+            parts.append("# LiteClaw cron error capture\n")
+            parts.append("Each entry is a failed cron execution with the pane snapshot at the\n")
+            parts.append("moment of failure. Append-only — newest at the bottom. Review later,\n")
+            parts.append("fix the root cause per entry, and optionally delete the entry.\n\n")
+        parts.append(f"## {ts} — `{job_id}`\n\n")
+        parts.append(f"- **error**: `{exc}`\n")
+        parts.append(f"- **cron**: `{job.get('cron_expr', '?')}` ({job.get('tz', '?')})\n")
+        parts.append(f"- **project**: `{job.get('project', '?')}`\n")
+        parts.append(f"- **timeout**: `{job.get('timeout', '?')}s`\n")
+        parts.append(f"- **tmux session**: `{session_name}`\n\n")
+        # Truncate pane to keep the file readable — 4 KB is plenty to see the
+        # last few dozen lines of Claude Code output around the failure.
+        if len(pane) > 4096:
+            pane = "…(truncated)…\n" + pane[-4096:]
+        parts.append("**pane snapshot**:\n\n")
+        parts.append("```\n")
+        parts.append(pane + ("\n" if not pane.endswith("\n") else ""))
+        parts.append("```\n\n---\n\n")
+        try:
+            with open(path, "a", encoding="utf-8") as f:
+                f.writelines(parts)
+            log.info(f"Cron error captured → {path}")
+        except OSError as e:
+            log.warning(f"Cron error capture write failed: {e}")
 
     def _agent_session_alive(self, session: str) -> bool:
         """Check if a tmux session is still running."""
@@ -1636,21 +1779,83 @@ class LiteClaw:
         else:
             self._log_offset = 0
 
+    def _load_current_session_id(self) -> str | None:
+        """Read the active LiteClaw session UUID from ~/.liteclaw/sessions.json.
+
+        Returns None if the file / key is missing. Safe to call at any time —
+        used both at startup and as a lazy refresh when _log_conversation
+        notices its cache is empty.
+        """
+        try:
+            if LITECLAW_SESSIONS.exists():
+                data = _json.loads(LITECLAW_SESSIONS.read_text(encoding="utf-8"))
+                sid = data.get("liteclaw_session_id")
+                if isinstance(sid, str) and sid:
+                    return sid
+        except Exception:
+            pass
+        return None
+
+    def _current_session_alias(self) -> int | None:
+        """Return the append-only integer index of the current session in
+        sessions.json.history[]. Small enough to stamp on every transcript
+        entry — a full UUID adds ~55 bytes per line; an int adds ~10.
+
+        Returns None if no session id is allocated yet. history[] is
+        append-only in _detect_resume_state, so indices are stable across
+        restarts and resolve back to the UUID via sessions.json.
+        """
+        sid = self._current_session_id or self._load_current_session_id()
+        if not sid:
+            return None
+        try:
+            data = _json.loads(LITECLAW_SESSIONS.read_text(encoding="utf-8")) if LITECLAW_SESSIONS.exists() else {}
+            history = data.get("history") or []
+            for idx, h in enumerate(history):
+                if h.get("id") == sid:
+                    return idx
+        except Exception:
+            pass
+        return None
+
     def _log_conversation(self, user_text: str, response: str, summarized: bool = False, meta: dict = None):
-        """Append a conversation turn to JSONL history file."""
+        """Append a conversation turn to JSONL history file.
+
+        Writes both the legacy single-file ~/.liteclaw-history.jsonl (for
+        back-compat with /recall) and the OpenClaw-style per-day transcript
+        under ~/.liteclaw/transcripts/YYYY-MM-DD.jsonl. Each entry is tagged
+        with the LiteClaw-owned session UUID so we can scope /recall session.
+        """
+        now = datetime.now()
+        # Refresh cached session id once if it's still unknown — start.sh may
+        # have allocated one after the daemon booted.
+        if not self._current_session_id:
+            self._current_session_id = self._load_current_session_id()
+        # Compact alias: integer index into sessions.json.history[] (tiny vs
+        # the ~55-byte UUID that would otherwise repeat on every turn).
+        sid_alias = self._current_session_alias()
         entry = {
-            "ts": datetime.now().isoformat(),
+            "ts": now.isoformat(),
+            "sid": sid_alias,
             "user": user_text[:500],  # cap to avoid bloat
             "response": response[:2000],  # keep summarized version (compact)
             "summarized": summarized,
         }
         if meta:
             entry["meta"] = meta
+        line = _json.dumps(entry, ensure_ascii=False) + "\n"
         try:
             with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-                f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
+                f.write(line)
         except OSError as e:
             log.warning(f"Failed to write history: {e}")
+        try:
+            LITECLAW_TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
+            daily = LITECLAW_TRANSCRIPTS / f"{now.strftime('%Y-%m-%d')}.jsonl"
+            with open(daily, "a", encoding="utf-8") as f:
+                f.write(line)
+        except OSError as e:
+            log.warning(f"Failed to write daily transcript: {e}")
 
     def _log_event(self, event_type: str, detail: str = ""):
         """Append behavioral event to ~/.liteclaw-events.jsonl"""
@@ -1660,6 +1865,497 @@ class LiteClaw:
                 f.write(_json.dumps(entry, ensure_ascii=False) + "\n")
         except Exception:
             pass
+
+    def _migrate_legacy_history(self) -> int:
+        """One-shot: split legacy single-file history into per-day transcripts.
+
+        Idempotent — if a daily file already exists with content, that day is
+        skipped. Returns the number of entries migrated.
+        """
+        if not HISTORY_FILE.exists():
+            return 0
+        try:
+            LITECLAW_TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning(f"Migration: cannot create {LITECLAW_TRANSCRIPTS}: {e}")
+            return 0
+        # Group entries by date and only append to days not yet populated.
+        existing_days = {p.stem for p in LITECLAW_TRANSCRIPTS.glob("*.jsonl") if p.stat().st_size > 0}
+        by_day: dict[str, list[str]] = {}
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.rstrip("\n")
+                    if not line:
+                        continue
+                    try:
+                        entry = _json.loads(line)
+                        ts = entry.get("ts", "")
+                        day = ts[:10] if len(ts) >= 10 else "unknown"
+                    except Exception:
+                        day = "unknown"
+                    if day in existing_days:
+                        continue
+                    by_day.setdefault(day, []).append(line + "\n")
+        except OSError as e:
+            log.warning(f"Migration: cannot read {HISTORY_FILE}: {e}")
+            return 0
+        moved = 0
+        for day, lines in by_day.items():
+            try:
+                with open(LITECLAW_TRANSCRIPTS / f"{day}.jsonl", "a", encoding="utf-8") as f:
+                    f.writelines(lines)
+                moved += len(lines)
+            except OSError as e:
+                log.warning(f"Migration: cannot write {day}.jsonl: {e}")
+        if moved:
+            log.info(f"Migrated {moved} legacy history entries into {LITECLAW_TRANSCRIPTS}")
+        return moved
+
+    def _compact_day(self, day: str) -> dict:
+        """Summarize ~/.liteclaw/transcripts/{day}.jsonl into memory/{day}.md.
+
+        Synchronous, best-effort. Skips when:
+          - the transcript doesn't exist or has <5 turns
+          - the memory file already exists (idempotent)
+          - the summarizer endpoint is unreachable
+        Returns {day, status: 'created'|'skipped'|'failed', reason, bytes}.
+        """
+        result = {"day": day, "status": "skipped", "reason": "", "bytes": 0}
+        src = LITECLAW_TRANSCRIPTS / f"{day}.jsonl"
+        dst = LITECLAW_MEMORY / f"{day}.md"
+        if not src.exists():
+            result["reason"] = "no transcript"
+            return result
+        if dst.exists() and dst.stat().st_size > 0:
+            result["reason"] = "already compacted"
+            return result
+        try:
+            entries = []
+            with open(src, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        entries.append(_json.loads(line))
+                    except Exception:
+                        pass
+        except OSError as e:
+            result["reason"] = f"read failed: {e}"
+            return result
+        if len(entries) < 5:
+            result["reason"] = f"only {len(entries)} turns"
+            return result
+        # Build a compact prompt — cap to keep token usage bounded.
+        bullets = []
+        for e in entries[-200:]:
+            ts = (e.get("ts", "") or "")[:19]
+            u = (e.get("user") or "").replace("\n", " ")[:300]
+            a = (e.get("response") or "").replace("\n", " ")[:500]
+            bullets.append(f"- [{ts}] U: {u}\n  A: {a}")
+        body = "\n".join(bullets)
+        sys_msg = (
+            "You are a strategic memory compactor for an autonomous coding agent. "
+            "Given a day of conversation turns (user msg + agent reply summaries), "
+            "produce a Markdown digest with these sections:\n"
+            "1) Goals & decisions made today\n"
+            "2) Open threads / unfinished work\n"
+            "3) Notable bugs, incidents, or surprises\n"
+            "4) Useful facts the agent should remember tomorrow\n"
+            "Be terse. Use bullets. Korean+English mix is fine. No fluff."
+        )
+        user_msg = f"Date: {day}\n\nTurns:\n{body}"
+        try:
+            with httpx.Client(timeout=45) as client:
+                r = client.post(
+                    f"{SUMMARIZER_URL}/chat/completions",
+                    json={
+                        "model": SUMMARIZER_MODEL,
+                        "messages": [
+                            {"role": "system", "content": sys_msg},
+                            {"role": "user", "content": user_msg},
+                        ],
+                        "temperature": 0.3,
+                    },
+                )
+            if r.status_code != 200:
+                result["reason"] = f"http {r.status_code}"
+                return result
+            content = r.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            result["reason"] = f"api: {e}"
+            return result
+        markdown = f"# {day} — daily memory\n_compacted: {datetime.now().isoformat(timespec='seconds')}_\n\n{content}\n"
+        try:
+            LITECLAW_MEMORY.mkdir(parents=True, exist_ok=True)
+            dst.write_text(markdown, encoding="utf-8")
+            result["status"] = "created"
+            result["bytes"] = len(markdown.encode("utf-8"))
+        except OSError as e:
+            result["reason"] = f"write failed: {e}"
+        return result
+
+    def _build_primer(self) -> dict:
+        """Build ~/.liteclaw/primer.md from strategic.md + recent N turns.
+
+        Returns a dict {primer_path, size_bytes, recent_turns, has_strategic}
+        usable by _send_boot_ready. Never raises — failures degrade silently.
+        """
+        info = {"path": str(LITECLAW_PRIMER), "size": 0, "recent": 0, "strategic": False}
+        try:
+            LITECLAW_DIR.mkdir(parents=True, exist_ok=True)
+            LITECLAW_MEMORY.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning(f"Primer: cannot create dirs: {e}")
+            return info
+        # Recent: last N turns from the legacy history (cheapest source covering
+        # all days). Once daily compaction is wired up, we can switch this to
+        # tail of today's transcripts/<today>.jsonl.
+        recent_lines: list[str] = []
+        if HISTORY_FILE.exists():
+            try:
+                with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                    tail = f.readlines()[-PRIMER_RECENT_TURNS:]
+                for raw in tail:
+                    try:
+                        e = _json.loads(raw)
+                    except Exception:
+                        continue
+                    ts = e.get("ts", "")[:19]
+                    user = (e.get("user") or "").strip().replace("\n", " ")
+                    resp = (e.get("response") or "").strip().replace("\n", " ")
+                    recent_lines.append(f"- [{ts}] U: {user[:160]}\n  A: {resp[:240]}")
+                info["recent"] = len(recent_lines)
+            except OSError as e:
+                log.warning(f"Primer: cannot read history: {e}")
+        # Strategic: optional rolling summary, with fallback to 3 most recent
+        # daily memory markdowns when no curated strategic.md exists yet.
+        strategic_text = ""
+        if LITECLAW_STRATEGIC.exists():
+            try:
+                strategic_text = LITECLAW_STRATEGIC.read_text(encoding="utf-8").strip()
+            except OSError:
+                pass
+        if not strategic_text and LITECLAW_MEMORY.is_dir():
+            try:
+                daily_mds = sorted(LITECLAW_MEMORY.glob("[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md"))
+                chunks = []
+                for md in daily_mds[-3:]:
+                    try:
+                        chunks.append(md.read_text(encoding="utf-8").strip())
+                    except OSError:
+                        continue
+                strategic_text = "\n\n---\n\n".join(chunks)
+            except OSError:
+                pass
+        info["strategic"] = bool(strategic_text)
+        parts = [
+            "# LiteClaw startup primer",
+            f"_built: {datetime.now().isoformat(timespec='seconds')}_",
+            "",
+        ]
+        if strategic_text:
+            parts += ["## Strategic memory", strategic_text, ""]
+        if recent_lines:
+            parts += [f"## Recent {len(recent_lines)} turns", *recent_lines, ""]
+        if not strategic_text and not recent_lines:
+            parts.append("_(no prior context yet — clean start)_")
+        body = "\n".join(parts) + "\n"
+        try:
+            LITECLAW_PRIMER.write_text(body, encoding="utf-8")
+            info["size"] = len(body.encode("utf-8"))
+        except OSError as e:
+            log.warning(f"Primer: cannot write {LITECLAW_PRIMER}: {e}")
+        return info
+
+    # ---- Claude Code session JSONL reading --------------------------------
+    # These helpers lift responses out of Claude's own session log at
+    #   ~/.claude/projects/<encoded-cwd>/<liteclaw_session_id>.jsonl
+    # instead of scraping the tmux TUI pane. The jsonl is append-only and
+    # structured (role/content blocks), so we get clean text + a reliable
+    # "this turn is done" signal via stop_reason.
+    def _jsonl_path(self) -> Path | None:
+        sid = self._current_session_id or self._load_current_session_id()
+        if not sid:
+            return None
+        encoded = str(CLAUDE_CWD).replace("/", "-")
+        p = Path.home() / ".claude" / "projects" / encoded / f"{sid}.jsonl"
+        return p if p.exists() else None
+
+    def _record_jsonl_offset(self) -> None:
+        """Stamp the current jsonl size so we can tail from here after send."""
+        try:
+            p = self._jsonl_path()
+            self._jsonl_offset = p.stat().st_size if p else 0
+        except Exception:
+            self._jsonl_offset = 0
+
+    def _tail_jsonl_since_offset(self) -> tuple[str, bool, int]:
+        """Read new jsonl content since `self._jsonl_offset`.
+
+        Returns (concatenated_text, turn_complete, total_bytes_read_since_offset).
+        text = concatenation of every assistant `text` block that appeared
+               after the offset (across possibly many assistant messages in
+               a single turn — e.g. tool_use → tool_result → more text).
+        turn_complete = True iff the LAST assistant message observed has a
+               stop_reason of end_turn / stop_sequence / max_tokens. A
+               `tool_use` stop_reason means Claude wants a tool result next —
+               still mid-turn, so we keep waiting.
+        total_bytes_read_since_offset is used by the caller to detect file
+        growth (Claude still writing) separately from text growth, so chains
+        of tool_use-only messages don't trip the "stable" early-exit.
+        """
+        p = self._jsonl_path()
+        if not p or not hasattr(self, "_jsonl_offset"):
+            return ("", False, 0)
+        try:
+            size = p.stat().st_size
+            if size <= self._jsonl_offset:
+                return ("", False, 0)
+            with open(p, "rb") as f:
+                f.seek(self._jsonl_offset)
+                chunk = f.read()
+        except Exception as e:
+            log.debug(f"jsonl tail read failed: {e}")
+            return ("", False, 0)
+        texts: list[str] = []
+        last_stop_reason = None
+        for raw in chunk.splitlines():
+            if not raw.strip():
+                continue
+            try:
+                obj = _json.loads(raw.decode("utf-8", errors="replace"))
+            except Exception:
+                continue
+            msg = obj.get("message") or {}
+            if msg.get("role") != "assistant":
+                continue
+            for block in msg.get("content") or []:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    t = block.get("text") or ""
+                    if t:
+                        texts.append(t)
+            sr = msg.get("stop_reason")
+            if sr:
+                last_stop_reason = sr
+        turn_complete = last_stop_reason in ("end_turn", "stop_sequence", "max_tokens")
+        return ("\n".join(texts).strip(), turn_complete, len(chunk))
+
+    async def _poll_response_via_jsonl(self, timeout: float = 600.0) -> str | None:
+        """Wait up to `timeout` seconds for a complete assistant turn in jsonl.
+
+        The completion signal is a stop_reason of end_turn / stop_sequence /
+        max_tokens on the last assistant message in the new range. A chain of
+        tool_use-only messages does NOT count as complete — we only return
+        early on a true stop.
+
+        Fallback "stable" safety net: if the jsonl file itself hasn't grown
+        in >15 s AND we have some text, assume the writer has flushed and
+        return what we have. File growth tracks BYTES (not just text blocks)
+        so long tool_use chains with no intermediate text don't trip it.
+
+        Side-effect: sets `self._jsonl_delivered_complete = True` when it
+        returns on a genuine stop_reason, so handle_message can skip the
+        follow-up monitor that would otherwise overwrite the delivered
+        message with a stale status edit.
+        """
+        self._jsonl_delivered_complete = False
+        if not USE_JSONL_RESPONSE:
+            return None
+        if not self._jsonl_path():
+            return None
+        deadline = time.monotonic() + timeout
+        last_text = ""
+        last_bytes = 0
+        quiet_since: float | None = None
+        while time.monotonic() < deadline:
+            text, complete, bytes_read = self._tail_jsonl_since_offset()
+            if complete and text:
+                self._jsonl_delivered_complete = True
+                return text
+            if bytes_read > last_bytes:
+                last_bytes = bytes_read
+                quiet_since = None  # file still growing → still working
+            elif text and quiet_since is None:
+                quiet_since = time.monotonic()  # growth paused, start idle timer
+            elif text and quiet_since is not None:
+                # File quiet for ≥15 s AND we have some text → assume flushed.
+                if time.monotonic() - quiet_since >= 15.0:
+                    log.info(f"jsonl quiet-since safety net tripped after {time.monotonic() - quiet_since:.1f}s idle")
+                    # Quiet-safety-net fired — text is likely final but we
+                    # never observed a stop_reason. Treat as complete for
+                    # follow-up suppression purposes (better than a stray
+                    # status-edit obliterating the clean text).
+                    self._jsonl_delivered_complete = True
+                    return text
+            if text and text != last_text:
+                last_text = text
+            await asyncio.sleep(1.0)
+        return last_text or None
+
+    def _detect_resume_state(self) -> dict:
+        """Report on the LiteClaw-owned Claude Code session.
+
+        start.sh allocates a stable UUID and stores it in
+        ~/.liteclaw/sessions.json under `liteclaw_session_id`, then launches
+        `claude --session-id <uuid>`. This pin makes resume deterministic even
+        when the user runs other Claude Code windows in the same cwd.
+
+        Also maintains `history[]` — appends a new entry whenever the
+        current session UUID changes (e.g. after --fork-session), so strategic
+        memory rollups can segment by session boundary instead of just by day.
+        """
+        info = {
+            "resumable": False,
+            "session_id": None,
+            "session_path": None,
+            "newest_age_min": None,
+        }
+        existing = {}
+        if LITECLAW_SESSIONS.exists():
+            try:
+                existing = _json.loads(LITECLAW_SESSIONS.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
+        sess_id = existing.get("liteclaw_session_id")
+        info["session_id"] = sess_id
+        # Refresh the in-memory cache used by _log_conversation.
+        if sess_id:
+            self._current_session_id = sess_id
+        # Maintain session lineage. Close the prior entry if the UUID changed,
+        # and open a new one. History entries are append-only dicts.
+        now_iso = datetime.now().isoformat(timespec="seconds")
+        history = existing.get("history")
+        if not isinstance(history, list):
+            history = []
+        last_entry = history[-1] if history else None
+        last_id = last_entry.get("id") if last_entry else None
+        if sess_id and sess_id != last_id:
+            if last_entry and last_entry.get("ended_at") is None:
+                last_entry["ended_at"] = now_iso
+            history.append({
+                "id": sess_id,
+                "started_at": now_iso,
+                "ended_at": None,
+                "cwd": str(CLAUDE_CWD),
+            })
+            existing["history"] = history
+        encoded = str(CLAUDE_CWD).replace("/", "-")
+        proj_dir = Path.home() / ".claude" / "projects" / encoded
+        if sess_id:
+            sess_file = proj_dir / f"{sess_id}.jsonl"
+            if sess_file.exists():
+                age_s = time.time() - sess_file.stat().st_mtime
+                info["resumable"] = True
+                info["session_path"] = str(sess_file)
+                info["newest_age_min"] = round(age_s / 60, 1)
+        # Persist a refreshed snapshot, preserving start.sh's keys.
+        try:
+            LITECLAW_DIR.mkdir(parents=True, exist_ok=True)
+            payload = dict(existing)
+            payload.update({
+                "cwd": str(CLAUDE_CWD),
+                "encoded": encoded,
+                "resumable": info["resumable"],
+                "session_path": info["session_path"],
+                "newest_age_min": info["newest_age_min"],
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+            })
+            LITECLAW_SESSIONS.write_text(_json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        except OSError:
+            pass
+        return info
+
+    def _send_boot_ready(self, extras: dict = None):
+        """Send a one-shot 'ready' Telegram message after bot init completes.
+
+        Synchronous (uses httpx.Client) because this fires before app.run_polling
+        takes over the event loop. Failures are logged but never block startup.
+        Set BOOT_NOTIFY=0 in .env to disable.
+        """
+        if not BOOT_NOTIFY:
+            log.info("Boot notify: disabled via BOOT_NOTIFY")
+            # Still intentionally fall through below — we want the bookkeeping
+            # (migrate, compact, primer build, resume state + history[]) to run
+            # even when the ping is disabled. We'll bail at the actual send.
+        # Compute rate-limit window (applied at send-time, not as an early
+        # return — otherwise sessions.json/primer bookkeeping gets skipped).
+        suppress_ping = not BOOT_NOTIFY
+        try:
+            last_boot_file = LITECLAW_DIR / ".last_boot_at"
+            now_ts = time.time()
+            if last_boot_file.exists():
+                try:
+                    prev = float(last_boot_file.read_text().strip())
+                except Exception:
+                    prev = 0.0
+                if now_ts - prev < 300:  # 5 minutes
+                    age = int(now_ts - prev)
+                    log.info(f"Boot notify: suppressed (last ping {age}s ago)")
+                    suppress_ping = True
+            LITECLAW_DIR.mkdir(parents=True, exist_ok=True)
+            last_boot_file.write_text(f"{now_ts}\n")
+        except Exception as e:
+            log.warning(f"Boot notify rate-limit check failed (continuing): {e}")
+        try:
+            import socket
+            host = socket.gethostname()
+        except Exception:
+            host = "?"
+        try:
+            history_turns = sum(1 for _ in open(HISTORY_FILE, "r", encoding="utf-8")) if HISTORY_FILE.exists() else 0
+        except OSError:
+            history_turns = 0
+        # Loop 4 enrichments: migrate legacy, compact yesterday, refresh primer,
+        # probe resume state. All best-effort — failures must not block startup.
+        try:
+            self._migrate_legacy_history()
+        except Exception as e:
+            log.warning(f"Migration during boot notify failed: {e}")
+        try:
+            from datetime import timedelta
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            r = self._compact_day(yesterday)
+            log.info(f"Compact {yesterday}: {r['status']} ({r.get('reason') or r.get('bytes')})")
+        except Exception as e:
+            log.warning(f"Compact day failed: {e}")
+        primer = self._build_primer()
+        resume = self._detect_resume_state()
+        lines = [
+            "🚀 LiteClaw ready",
+            f"Host:    {host}",
+            f"Target:  {self.target}",
+            f"History: {history_turns} turns",
+        ]
+        sid = resume.get("session_id")
+        sid_short = sid[:8] if sid else "?"
+        if resume.get("resumable"):
+            age = resume.get("newest_age_min")
+            age_s = f", last touch {age}m ago" if age is not None else ""
+            lines.append(f"Resume:  {sid_short} ({CLAUDE_CWD}{age_s})")
+        elif sid:
+            lines.append(f"Resume:  {sid_short} (new session — first run)")
+        else:
+            lines.append("Resume:  none (no session id allocated)")
+        primer_kb = round(primer.get("size", 0) / 1024, 1)
+        strat = "+strategic" if primer.get("strategic") else ""
+        lines.append(f"Primer:  {primer.get('recent', 0)} recent turns{strat} ({primer_kb} KB)")
+        if extras:
+            for k, v in extras.items():
+                lines.append(f"{k}: {v}")
+        text = "\n".join(lines)
+        if suppress_ping:
+            return
+        try:
+            with httpx.Client(timeout=10) as client:
+                r = client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": True},
+                )
+                if r.status_code != 200:
+                    log.warning(f"Boot notify failed: HTTP {r.status_code} {r.text[:200]}")
+                else:
+                    log.info(f"Boot notify sent ({len(text)} chars)")
+        except Exception as e:
+            log.warning(f"Boot notify exception: {e}")
 
     def _read_new_output(self) -> str:
         """Read new output from pipe log since last recorded offset."""
@@ -2691,9 +3387,12 @@ class LiteClaw:
         """Recall recent conversation history, optionally filtered by keyword.
 
         Usage:
-            /recall          — summarize last 20 conversations
-            /recall 50       — summarize last 50 conversations
-            /recall keyword  — search + summarize matching conversations
+            /recall                    — summarize last 20 conversations
+            /recall 50                 — summarize last 50 conversations
+            /recall keyword            — search + summarize matching conversations
+            /recall session            — restrict to the current LiteClaw session
+            /recall session <uuid>     — restrict to a specific past session UUID
+            /recall session keyword    — session-scoped keyword search
         """
         if not self._auth(update):
             return
@@ -2702,15 +3401,32 @@ class LiteClaw:
             await update.message.reply_text("No conversation history yet.")
             return
 
-        # Parse args: number or keyword
-        args = ctx.args
+        # Parse args: number, keyword, or session-scope.
+        args = list(ctx.args) if ctx.args else []
         limit = HISTORY_RECALL_LIMIT
         keyword = None
+        session_filter: str | None = None  # UUID or sentinel "__current__"
+        if args and args[0].lower() == "session":
+            args = args[1:]
+            session_filter = "__current__"
+            # Optional UUID (8+ hex chars with dashes) as 2nd token
+            if args and re.fullmatch(r"[0-9a-fA-F-]{8,}", args[0]):
+                session_filter = args[0]
+                args = args[1:]
         if args:
             if args[0].isdigit():
                 limit = min(int(args[0]), 200)
             else:
                 keyword = " ".join(args).lower()
+
+        # Resolve __current__ to the active UUID.
+        if session_filter == "__current__":
+            session_filter = self._current_session_id or self._load_current_session_id()
+            if not session_filter:
+                await update.message.reply_text(
+                    "현재 세션 ID가 아직 없습니다 (start.sh 재실행 필요 또는 session_id 미기록 상태)."
+                )
+                return
 
         # Read history (tail for efficiency)
         try:
@@ -2727,6 +3443,28 @@ class LiteClaw:
                 entries.append(_json.loads(line))
             except _json.JSONDecodeError:
                 continue
+
+        if session_filter:
+            # Accept both legacy full-UUID entries and compact alias entries.
+            # Resolve the filter to a candidate alias int via sessions.json.
+            sid_alias_target: int | None = None
+            try:
+                data = _json.loads(LITECLAW_SESSIONS.read_text(encoding="utf-8")) if LITECLAW_SESSIONS.exists() else {}
+                for idx, h in enumerate(data.get("history") or []):
+                    if h.get("id") == session_filter:
+                        sid_alias_target = idx
+                        break
+            except Exception:
+                pass
+            def _match(e):
+                # New schema: "sid" is int
+                if "sid" in e and sid_alias_target is not None and e["sid"] == sid_alias_target:
+                    return True
+                # Legacy schema: "session_id" was full UUID
+                if e.get("session_id") == session_filter:
+                    return True
+                return False
+            entries = [e for e in entries if _match(e)]
 
         if keyword:
             entries = [
@@ -2984,8 +3722,9 @@ class LiteClaw:
                     parse_mode="Markdown",
                 )
 
-            # Record offset before sending
+            # Record offset before sending (both pipe-pane log and session jsonl)
             self._record_offset()
+            self._record_jsonl_offset()
 
             # Snapshot pane BEFORE sending for reliable diff extraction
             pre_snapshot = capture_pane(self.target, lines=SCROLLBACK_LINES)
@@ -2998,10 +3737,40 @@ class LiteClaw:
 
             sent_msg = None
             if claude_idle:
-                sent_msg = await update.message.reply_text("📤 Sent. Waiting for response...")
+                sent_msg = await update.message.reply_text("⏳ 작업 중…")
 
             # Poll for response with streaming feedback
             response = await self._poll_response(ctx.bot, user_text, pre_snapshot=pre_snapshot)
+
+            # Phase A: prefer the structured session jsonl — this bypasses
+            # tmux pane scrollback truncation, ANSI/spinner chrome ("Thinking
+            # (Crystalizing)…"), and the summarizer's over-compression. Falls
+            # back silently to the pane-derived response if jsonl isn't
+            # available (missing path, race, or unparseable).
+            if USE_JSONL_RESPONSE:
+                try:
+                    # Generous timeout — tool-heavy turns can run 5+ minutes.
+                    # The inner loop still exits the moment stop_reason is set.
+                    jsonl_text = await self._poll_response_via_jsonl(timeout=600.0)
+                except Exception as e:
+                    log.warning(f"jsonl poll raised: {e}")
+                    jsonl_text = None
+                # Sanity guard: if jsonl somehow returned *much less* than the
+                # pane-derived response, that usually means we returned the
+                # preamble text only (tool_use chain still going). Prefer the
+                # pane-derived version in that case so the user doesn't see a
+                # truncated "이해했습니다…" stub.
+                pane_len = len(response)
+                jsonl_len = len(jsonl_text or "")
+                if jsonl_text and (pane_len == 0 or jsonl_len >= pane_len * 0.5):
+                    log.info(f"Response via jsonl: {jsonl_len} chars (replacing pane-derived {pane_len} chars)")
+                    response = jsonl_text
+                    # jsonl text is already clean — skip the summarizer pass.
+                    self._skip_summarizer_once = True
+                elif jsonl_text:
+                    log.warning(
+                        f"jsonl returned {jsonl_len} chars but pane has {pane_len} — keeping pane-derived"
+                    )
 
             # Delete status messages before delivering final response
             for msg in (sent_msg, busy_msg):
@@ -3024,11 +3793,20 @@ class LiteClaw:
             # Deliver response (with persistent retry)
             delivered_msg_id = await self._deliver_response(response, user_text, update, ctx, meta=_conv_meta)
 
-            # Schedule follow-up check: if Claude produces more output, edit the message
-            if delivered_msg_id:
+            # Schedule follow-up only when pane-scrape was the source. When the
+            # jsonl path returned a complete (`stop_reason=end_turn`) turn,
+            # there is literally no more assistant output coming — spinning up
+            # the follow-up monitor just leads it to overwrite our clean final
+            # message with a "⏳ Working... (Ns)" status edit (issue: user's
+            # delivered message gets replaced by a short truncated one).
+            skip_followup = bool(getattr(self, "_jsonl_delivered_complete", False))
+            self._jsonl_delivered_complete = False  # one-shot reset
+            if delivered_msg_id and not skip_followup:
                 self._followup_task = asyncio.create_task(
                     self._followup_edit(user_text, pre_snapshot, delivered_msg_id, ctx.bot)
                 )
+            elif skip_followup:
+                log.info("Skipping _followup_edit (jsonl turn already complete)")
 
         except RuntimeError as e:
             await update.message.reply_text(f"Error: {e}")
@@ -3085,7 +3863,14 @@ class LiteClaw:
         if not response.strip():
             response = "(reasoning only — no final answer extracted)"
 
-        if not self.raw_mode:
+        # Phase A: if jsonl gave us a clean response, skip the summarizer
+        # entirely — no ANSI/spinner noise to strip, no content compression
+        # to suffer. One-shot flag cleared immediately.
+        skip_sum = getattr(self, "_skip_summarizer_once", False)
+        self._skip_summarizer_once = False
+        if skip_sum:
+            log.info(f"Summarizer skipped (jsonl-sourced response, {len(response)} chars)")
+        elif not self.raw_mode:
             try:
                 await ctx.bot.send_chat_action(chat_id=CHAT_ID, action=ChatAction.TYPING)
             except Exception:
@@ -3678,8 +4463,10 @@ class LiteClaw:
                     self._last_interactive_options = list(interactive.get("options", []))
                     await self._send_interactive_prompt(bot, interactive)
 
-            # Status update at adaptive interval — show last few meaningful lines
-            if elapsed - last_status >= status_interval:
+            # Status update at adaptive interval — show last few meaningful lines.
+            # Gated by SHOW_POLLING_STATUS: off by default because this path is
+            # what surfaced "Thinking (Crystalizing)…" TUI chrome in Telegram.
+            if SHOW_POLLING_STATUS and elapsed - last_status >= status_interval:
                 last_status = elapsed
                 status_capture = capture_pane(self.target, lines=15)
                 preview_text = clean_output(status_capture).strip()
@@ -4323,6 +5110,9 @@ class LiteClaw:
 
         log.info(f"Bridge started. Target: {self.target}")
         log.info("Send a message to your Telegram bot to begin.")
+        # Loop 4 will populate `extras` with resume/primer status; for now this
+        # ships the basic ready ping so users know startup completed.
+        self._send_boot_ready()
         app.run_polling(drop_pending_updates=False)
 
 

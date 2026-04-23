@@ -1,5 +1,48 @@
 # Changelog
 
+## v0.6.1 (2026-04-23) — Daemon-restart resilience, /tell-summarizer, community hygiene
+
+### Added
+- **Daemon-restart resilience** — user replies no longer disappear when the daemon is restarted mid-poll.
+  - `~/.liteclaw/pending_replies.json` records every user message whose placeholder ("⏳ 작업 중…") was sent but not yet answered (user_msg_id, placeholder_msg_id, chat_id, jsonl offset, sent timestamp, target).
+  - `_resume_pending_on_boot` runs from `Application.post_init`. For each pending entry it either (a) reads the session jsonl and edits the placeholder with the now-completed answer, (b) spawns a background task to finish polling, or (c) marks the placeholder as "재기동으로 유실됨" if older than `PENDING_MAX_AGE_SEC` (default 900 s).
+  - `run_polling` now passes `stop_signals=(SIGINT, SIGTERM)` explicitly so `pkill liteclaw` triggers PTB's graceful drain. Hard kills / crashes are covered by the persistent-pending path.
+  - New env: `PENDING_MAX_AGE_SEC` (default 900).
+- **`/tell-summarizer` command** (alias `/tellsum`) — runtime control over the summarizer system prompt. `/tellsum <instruction>` appends, `/tellsum show` displays, `/tellsum clear` resets. Persists in-memory only.
+- **Community hygiene** — `CONTRIBUTING.md`, `.github/workflows/ci.yml` (AST parse + `bash -n` + requirements import smoke + advisory ruff lint), `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.md`, shields.io badges in both READMEs.
+
+### Changed
+- **`SUMMARIZE_PROMPT`** gained a **PRESERVE-AS-IS** block — numbered / lettered option lists ("B / C / D 선택") must reach Telegram verbatim. The summarizer previously kept "Pick one" while dropping the option bodies.
+
+---
+
+## v0.6.0 (2026-04-20 → 2026-04-21) — jsonl response path, session memory, global CLI, cron hardening
+
+(Merged via https://github.com/breaktheready/liteclaw/pull/1)
+
+### Added
+- **Global `liteclaw` CLI** — `liteclaw start|stop|restart|status|logs|attach` from any directory. `setup.sh` installs a symlink at `~/.local/bin/liteclaw`.
+- **Pinned Claude Code session via `--session-id <uuid>`** — `start.sh` allocates / adopts a stable UUID in `~/.liteclaw/sessions.json.liteclaw_session_id` and always resumes the same conversation, unaffected by other Claude Code windows in the same cwd.
+- **JSONL response path** (Phase A) — responses are lifted from Claude Code's own session log (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`) instead of scraping the tmux pane. No ANSI chrome, no scrollback truncation, no summarizer over-compression. Automatic fallback to pane-scrape on jsonl failure.
+- **OpenClaw-style memory layout** (`~/.liteclaw/`) — per-day transcripts, daily markdown digests (LLM-compacted), rolling strategic summary, startup primer. Legacy `~/.liteclaw-history.jsonl` auto-migrates.
+- **Compact session-id alias (`sid`)** in transcripts — integer index into `sessions.json.history[]`, ~70 % shorter per row than embedding the full UUID.
+- **`/recall session [uuid]`** — session-scoped recall.
+- **Boot-ready Telegram ping** — one-shot "🚀 LiteClaw ready" after init, rate-limited to 5 min.
+- **`~/.liteclaw/cron-error-capture.md`** — forensic log of failed cron runs (job config + pane snapshot).
+
+### Fixed
+- **`is_idle_prompt` false-positive** on Claude Code UI chrome ("· Claude Max", "· Share Claude Code…") that jammed the cron busy-wait at 120 s. Removed `·` and `*` from `_SPINNER_CHARS`, anchored `_ACTIVITY_PATTERNS` to line start.
+- **Cron trust prompt** auto-accept in `_run_cron_job` for unattended project dirs.
+- **APScheduler weekday indexing** — `1-5` was Tue-Sat instead of Mon-Fri.
+- **Mid-poll status edits** leaking "Thinking (Crystalizing)…" into Telegram. Gated behind `SHOW_POLLING_STATUS` (off by default).
+- **`_followup_edit` overwriting delivered messages** with stale status edits when jsonl path had already returned a complete turn. Now skipped when `_jsonl_delivered_complete` is set.
+
+### Changed
+- Placeholder text "📤 Sent. Waiting for response…" → "⏳ 작업 중…".
+- `setup.sh` plants sensible `~/.tmux.conf` defaults when missing (mouse on, history-limit 50000).
+
+---
+
 ## v0.5.0 (2026-04-17) — CLI Mirror, Draft Streaming, Reasoning Lane & Skill System
 
 ### Added

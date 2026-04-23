@@ -1,5 +1,11 @@
 # LiteClaw
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#플랫폼-지원)
+[![CI](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/breaktheready/liteclaw?style=social)](https://github.com/breaktheready/liteclaw/stargazers)
+
 텔레그램으로 Claude Code CLI를 원격 제어. 추가 API 키 불필요.
 
 [English](README.md)
@@ -42,6 +48,21 @@ Claude API를 직접 호출하는 도구들과 달리 (= 추가 비용), LiteCla
 - **멀티 에이전트 오케스트레이션** — LiteClaw이 org lead 역할로 독립적인 peer 에이전트들을 별도 tmux 세션에서 관리합니다. 새 명령어: `/agents`, `/agent new|status|remove`, `/assign`. 에이전트 레지스트리는 재시작 후에도 유지됩니다.
 - **자동 복구** — API 프록시 다운타임을 자동 감지하고 복구합니다. 401 에러 시 Claude Code 세션을 자동 재인증하고, 복구 완료 시 텔레그램으로 알림을 보냅니다.
 - **통합 알림** — 모든 텔레그램 알림이 단일 `notify.py` 모듈을 통해 요약기를 거쳐 전달됩니다. 요약기를 사용할 수 없는 경우 원본 출력으로 자동 전환됩니다.
+
+## v0.6 업데이트 (2026년 4월)
+
+안정성, 전달 품질, 에이전트 연속성에 집중:
+
+- **전역 `liteclaw` CLI** — 어느 디렉토리에서든 `liteclaw start|stop|restart|status|logs|attach`. `setup.sh`가 `~/.local/bin/liteclaw`에 심링크 설치.
+- **Claude Code 세션 고정 (`--session-id <uuid>`)** — `start.sh`가 안정적인 UUID를 발급/채택해서 `~/.liteclaw/sessions.json`에 저장. 같은 cwd에서 다른 Claude Code 창을 열어도 LiteClaw는 항상 자기 세션에 이어붙음.
+- **구조화된 JSONL 응답 경로** — tmux 화면을 긁는 대신 Claude Code 본인의 세션 로그(`~/.claude/projects/<cwd>/<id>.jsonl`)를 읽어 응답을 추출. ANSI 노이즈, 스크롤백 잘림, 요약기 과압축 모두 제거. jsonl 실패 시 기존 pane 경로로 자동 폴백.
+- **OpenClaw 스타일 메모리 레이아웃** (`~/.liteclaw/`) — 일별 transcript, 일별 markdown 다이제스트(LLM 압축), 장기 전략 요약, 기동 시 프라이머 자동 합성. 기존 `~/.liteclaw-history.jsonl`은 첫 부팅 때 자동 마이그레이션.
+- **부팅 완료 텔레그램 알림** — init 완료 후 "🚀 LiteClaw ready" + resume 상태 + primer 크기 전송. 5분 내 재기동 시 자동 생략(`BOOT_NOTIFY`).
+- **크론 내구성 강화** — trust 프롬프트 자동 수락, `is_idle_prompt` 오탐 수정(Claude UI chrome에 걸려 120초 타임아웃 나던 버그), 300초 허용창과 stable-prompt 폴백, 실패 시 pane 스냅샷 포함 전체 기록이 `~/.liteclaw/cron-error-capture.md`에 누적.
+- **`/recall session [uuid]`** — 현재 세션 또는 특정 세션 내 대화만 요약/검색. 각 transcript 엔트리엔 `sessions.json.history[]` 배열 인덱스(`sid`)만 심어서 풀 UUID 대비 ~70% 짧음.
+- **조용해진 텔레그램 UX** — 폴링 중간 상태 편집 기본 OFF(`SHOW_POLLING_STATUS=0`); jsonl로 완결된 턴은 follow-up 모니터를 건너뛰어 배달된 메시지가 상태 편집으로 덮어쓰이지 않음.
+
+변화 배경과 파킹 로트 아이디어는 `DEVNOTES.md` 참조.
 
 ## 빠른 시작
 
@@ -98,6 +119,29 @@ TMUX_TARGET=claude:1
 
 #### 실행
 
+**권장: 전역 `liteclaw` 명령** — `setup.sh`가 `~/.local/bin/liteclaw`에 심링크를 만들어두므로 어느 디렉토리에서든:
+
+```bash
+liteclaw start            # Claude Code(tmux 'claude') + LiteClaw 데몬 기동
+liteclaw start --attach   # 그리고 claude pane에 attach
+liteclaw stop             # 둘 다 종료
+liteclaw restart          # stop + start
+liteclaw status           # tmux 세션, 데몬 pid, 대시보드 포트 요약
+liteclaw logs [-f]        # /tmp/liteclaw_run.log tail
+liteclaw attach           # tmux attach -t claude
+```
+
+**직접 실행 (대체)**:
+
+```bash
+bash ./start.sh           # 위와 동일, 저장소 안에서만 동작
+bash ./start.sh --attach
+```
+
+**세션 고정**: `start.sh`가 첫 실행 시 안정 UUID 하나를 발급하거나 기존 세션을 채택해서 `~/.liteclaw/sessions.json`에 저장합니다. 그 후 `liteclaw start` 할 때마다 `claude --session-id <uuid>`로 같은 대화를 복귀 — 같은 cwd에 다른 Claude Code 창이 있어도 LiteClaw는 자기 세션 고수.
+
+수동 설정이 필요하면 원래 방식도 그대로 동작:
+
 ```bash
 # 터미널 1: Claude Code 시작
 tmux new-session -s claude 'claude --dangerously-skip-permissions'
@@ -124,8 +168,14 @@ python3 liteclaw.py
 | `EXTRA_PROMPT_PATTERNS` | (비어있음) | 커스텀 프롬프트 감지용 정규식 (쉼표 구분) |
 | `PROXY_DIR` | `~/max_api_proxy` | API 프록시 디렉토리 (자동 복구용 `docker compose up -d`) |
 | `DASHBOARD_PORT` | `7777` | 웹 대시보드 포트 (`0`으로 비활성화) |
-| `HISTORY_FILE` | `~/.liteclaw-history.jsonl` | 대화 기록 파일 위치 |
+| `HISTORY_FILE` | `~/.liteclaw-history.jsonl` | 레거시 단일 파일 대화 기록 (`/recall` back-compat용으로 계속 기록) |
 | `HISTORY_RECALL_LIMIT` | `50` | `/recall` 최대 반환 개수 |
+| `BOOT_NOTIFY` | `1` | 데몬 기동 완료 후 "LiteClaw ready" 텔레그램 알림 (0으로 비활성화) |
+| `LITECLAW_DIR` | `~/.liteclaw` | OpenClaw 스타일 메모리 루트 (`transcripts/`, `memory/`, `sessions.json`, `primer.md`) |
+| `CLAUDE_CWD` | `$HOME` | `start.sh`가 Claude Code를 띄우는 고정 cwd. 세션 JSONL 위치(`~/.claude/projects/<encoded-cwd>/`) 해석에 사용 |
+| `PRIMER_RECENT_TURNS` | `20` | `primer.md` 합성 시 최근 이력에서 당길 turn 수 |
+| `USE_JSONL_RESPONSE` | `1` | Claude Code 세션 JSONL을 응답 소스로 우선 사용 (실패 시 pane 스크래프로 자동 폴백). `0`이면 pane 강제 |
+| `SHOW_POLLING_STATUS` | `0` | Claude가 작업 중일 때 중간 "Working…" 상태를 텔레그램에 보낼지 여부. 기본 OFF — 이게 메시지 중간 덮어쓰기의 원인이었음 |
 
 ## 텔레그램 명령어
 

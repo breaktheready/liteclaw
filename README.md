@@ -1,5 +1,11 @@
 # LiteClaw
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)](#platform-support)
+[![CI](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/breaktheready/liteclaw/actions/workflows/ci.yml)
+[![GitHub stars](https://img.shields.io/github/stars/breaktheready/liteclaw?style=social)](https://github.com/breaktheready/liteclaw/stargazers)
+
 Control Claude Code CLI remotely via Telegram. No API key needed.
 
 [한국어](README_KO.md)
@@ -47,6 +53,23 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
 
 ---
 
+## What's new in v0.6 (April 2026)
+
+Focused on reliability, delivery quality, and agent continuity:
+
+- **Global `liteclaw` CLI** — `liteclaw start|stop|restart|status|logs|attach` from any directory. `setup.sh` installs a symlink in `~/.local/bin/liteclaw`.
+- **Pinned Claude Code session (`--session-id <uuid>`)** — `start.sh` allocates / adopts a stable UUID and always resumes the same conversation, even when other Claude Code windows are open in the same cwd.
+- **Structured JSONL response path** — responses are now lifted from Claude Code's own session log (`~/.claude/projects/<cwd>/<id>.jsonl`) instead of scraping the tmux pane. No more ANSI chrome, no scroll-back truncation, no summarizer over-compression on long answers. Automatic fallback to the pane path if jsonl is unavailable.
+- **OpenClaw-style memory layout** (`~/.liteclaw/`) — per-day transcripts, daily markdown digests (LLM-compacted), rolling strategic summary, and a startup primer assembled from recent + strategic context. Legacy `~/.liteclaw-history.jsonl` auto-migrates on first boot.
+- **Boot-ready Telegram ping** — one-shot "🚀 LiteClaw ready" after init with resume state + primer size. Rate-limited to avoid dev-churn spam (`BOOT_NOTIFY`).
+- **Cron hardening** — trust-prompt auto-accept, `is_idle_prompt` false-positive fix (Claude's UI chrome no longer jams the busy-wait), 300 s tolerance window with a stable-prompt fallback, and failures are captured with full pane snapshot to `~/.liteclaw/cron-error-capture.md` for later review.
+- **`/recall session [uuid]`** — session-scoped conversation recall. Transcripts carry a compact integer alias (`sid`) into `sessions.json.history[]` so every row is ~70 % smaller than embedding the full UUID.
+- **Quieter Telegram UX** — mid-poll status edits off by default (`SHOW_POLLING_STATUS=0`); completed jsonl turns skip the follow-up monitor so the final message is never overwritten with a stale status edit.
+
+See `DEVNOTES.md` for the story behind these changes and the parking-lot for related ideas.
+
+---
+
 ## Prerequisites
 
 - **Python** 3.10+
@@ -59,6 +82,14 @@ Unlike tools that call Claude's API directly (which means extra costs), LiteClaw
   - Any OpenAI-compatible endpoint works (OpenAI, Groq, local LLM, etc.) — just point `SUMMARIZER_URL` / `SUMMARIZER_MODEL` at it
   - The default `SUMMARIZER_URL` is `http://localhost:3456/v1` (matches the recommended proxy's default port)
 - **(Optional) Docker** — only needed if your API proxy runs in a container
+
+### Platform support
+
+| Platform | Status | Notes |
+|---|---|---|
+| Linux | ✅ Primary target | Docker proxy works directly |
+| macOS | ✅ Supported | Run the proxy as a **LaunchAgent** instead of Docker — Docker can't read the keychain. See [MAC-OPS.md](./MAC-OPS.md). Use [`start.sh`](./start.sh) to launch Claude Code + LiteClaw together. |
+| Windows | ⚠️ Not native | LiteClaw depends on tmux. Run under **WSL** (Ubuntu/Debian) and follow the Linux path. Native PowerShell/cmd is not supported. |
 
 ---
 
@@ -110,6 +141,24 @@ python3 liteclaw.py
 
 Send `/start` to your Telegram bot to confirm it is working.
 
+### One-command launch (`start.sh` or global `liteclaw`)
+
+`setup.sh` symlinks a global `liteclaw` dispatcher into `~/.local/bin/`, so once installed you can run from any directory:
+
+```bash
+liteclaw start            # bring up Claude Code (tmux 'claude') + LiteClaw daemon
+liteclaw start --attach   # ... and attach to the claude pane after
+liteclaw stop             # tear both down
+liteclaw restart          # stop + start
+liteclaw status           # tmux sessions, daemon pid, dashboard port
+liteclaw logs [-f]        # tail /tmp/liteclaw_run.log
+liteclaw attach           # tmux attach -t claude
+```
+
+The underlying `bash ./start.sh [--attach]` still works for direct invocation. It's idempotent — re-running is a no-op when both are already up. Order is enforced (Claude Code first, prompt-readiness wait, then LiteClaw) so the bridge always has a target. The "trust this folder" dialog is auto-accepted.
+
+**Session pinning**: `start.sh` allocates (or adopts) a stable UUID on first run and stores it in `~/.liteclaw/sessions.json`, then launches `claude --session-id <uuid>`. Every subsequent `liteclaw start` resumes the *same* conversation — unaffected by other Claude Code windows you may open in the same cwd.
+
 ---
 
 ## Configuration
@@ -129,8 +178,14 @@ All settings are controlled via `.env`. Copy `.env.example` and edit as needed.
 | `EXTRA_PROMPT_PATTERNS` | (empty) | Comma-separated regex patterns for custom prompt detection |
 | `PROXY_DIR` | `~/max_api_proxy` | API proxy directory for auto-recovery (`docker compose up -d`) |
 | `DASHBOARD_PORT` | `7777` | Web dashboard port (set `0` to disable) |
-| `HISTORY_FILE` | `~/.liteclaw-history.jsonl` | Conversation history location |
+| `HISTORY_FILE` | `~/.liteclaw-history.jsonl` | Legacy single-file conversation history (still written for back-compat with `/recall`) |
 | `HISTORY_RECALL_LIMIT` | `50` | Max entries returned by `/recall` |
+| `BOOT_NOTIFY` | `1` | Send a one-shot "LiteClaw ready" Telegram ping after init. `0` to disable. |
+| `LITECLAW_DIR` | `~/.liteclaw` | Root of the OpenClaw-style memory layout (`transcripts/`, `memory/`, `sessions.json`, `primer.md`) |
+| `CLAUDE_CWD` | `$HOME` | Pinned working directory where `start.sh` launches Claude Code. Used to locate the session JSONL under `~/.claude/projects/<encoded-cwd>/`. |
+| `PRIMER_RECENT_TURNS` | `20` | Turns pulled from recent history when building `primer.md` |
+| `USE_JSONL_RESPONSE` | `1` | Prefer Claude Code's session JSONL as the response source (falls back to pane scraping on failure). `0` to force pane path. |
+| `SHOW_POLLING_STATUS` | `0` | Emit intermediate "Working…" status edits to Telegram while Claude works. Off by default — these were the source of garbled mid-answer updates. |
 
 ---
 

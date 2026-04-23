@@ -102,6 +102,12 @@ LITECLAW_MEMORY = LITECLAW_DIR / "memory"
 LITECLAW_STRATEGIC = LITECLAW_MEMORY / "strategic.md"
 LITECLAW_PRIMER = LITECLAW_DIR / "primer.md"
 LITECLAW_SESSIONS = LITECLAW_DIR / "sessions.json"
+# Pending replies — user messages whose placeholder was sent but the response
+# wasn't delivered before the daemon stopped. Persisted so a restart can read
+# the session jsonl, find the now-completed turn, and edit the placeholder
+# in-place. See _record_pending / _resume_pending_on_boot.
+LITECLAW_PENDING = LITECLAW_DIR / "pending_replies.json"
+PENDING_MAX_AGE_SEC = int(os.environ.get("PENDING_MAX_AGE_SEC", "900"))  # 15 min
 
 # Boot notification (sent to Telegram once after the bot is fully initialized)
 BOOT_NOTIFY = os.environ.get("BOOT_NOTIFY", "1").lower() not in ("0", "false", "no", "off")
@@ -922,6 +928,9 @@ class LiteClaw:
         # Phase A: jsonl-based response extraction state.
         self._jsonl_offset: int = 0
         self._skip_summarizer_once: bool = False
+        # Daemon-restart resilience: graceful shutdown flag + pending file.
+        self._shutting_down: bool = False
+        self._summarizer_extra_prompt: str = ""
 
     def _load_config(self):
         """Load persisted runtime toggles from ~/.liteclaw/config.json."""
@@ -2263,6 +2272,162 @@ class LiteClaw:
         except OSError:
             pass
         return info
+
+    # ---- Daemon-restart resilience -----------------------------------------
+    # When the daemon is restarted (intentional or crash) while a user reply
+    # is in-flight, the response would otherwise be silently lost — the
+    # placeholder Telegram message keeps showing "⏳ 작업 중…" forever. To
+    # avoid that, every time we send a placeholder we record the (user_msg_id,
+    # placeholder_msg_id, jsonl_offset, sent_at) tuple to a persistent file.
+    # On boot, we read that file and either deliver the now-completed answer
+    # from the session jsonl, resume polling, or mark the placeholder as
+    # "재기동으로 유실" if it's stale.
+    def _read_pending(self) -> dict:
+        try:
+            return _json.loads(LITECLAW_PENDING.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"version": 1, "pending": []}
+        except Exception as e:
+            log.warning(f"pending file unreadable, resetting: {e}")
+            return {"version": 1, "pending": []}
+
+    def _write_pending(self, data: dict) -> None:
+        try:
+            LITECLAW_DIR.mkdir(parents=True, exist_ok=True)
+            LITECLAW_PENDING.write_text(_json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        except OSError as e:
+            log.warning(f"pending file write failed: {e}")
+
+    def _record_pending(self, user_msg_id: int, placeholder_msg_id: int | None,
+                        chat_id: int, user_text: str) -> None:
+        """Mark a user message as awaiting reply. Called right after the
+        placeholder ('⏳ 작업 중…') is sent, before _poll_response begins."""
+        data = self._read_pending()
+        # Drop any prior pending entry for this same user message (re-record on retry)
+        data["pending"] = [e for e in data.get("pending", []) if e.get("user_msg_id") != user_msg_id]
+        data["pending"].append({
+            "user_msg_id": user_msg_id,
+            "placeholder_msg_id": placeholder_msg_id,
+            "chat_id": chat_id,
+            "user_text": (user_text or "")[:500],
+            "jsonl_offset": getattr(self, "_jsonl_offset", 0),
+            "jsonl_session_id": self._current_session_id,
+            "sent_at": datetime.now().isoformat(timespec="seconds"),
+            "target": self.target,
+        })
+        # Cap at 50 entries to keep file small in case of leak
+        data["pending"] = data["pending"][-50:]
+        self._write_pending(data)
+
+    def _clear_pending(self, user_msg_id: int) -> None:
+        """Drop the pending entry once we've successfully delivered the reply."""
+        try:
+            data = self._read_pending()
+            before = len(data.get("pending", []))
+            data["pending"] = [e for e in data.get("pending", []) if e.get("user_msg_id") != user_msg_id]
+            if len(data["pending"]) != before:
+                self._write_pending(data)
+        except Exception as e:
+            log.warning(f"_clear_pending failed: {e}")
+
+    async def _resume_pending_on_boot(self, app) -> None:
+        """Run once on daemon startup. For each pending entry:
+          - if jsonl already has a complete turn → edit placeholder, drop entry
+          - else if entry is stale → mark placeholder as lost, drop entry
+          - else → spawn a background task that keeps polling jsonl
+        Called from Application.post_init.
+        """
+        data = self._read_pending()
+        entries = data.get("pending", [])
+        if not entries:
+            return
+        log.info(f"Resume-on-boot: {len(entries)} pending entr{'y' if len(entries)==1 else 'ies'}")
+        bot = app.bot
+        survivors: list[dict] = []
+        for entry in entries:
+            try:
+                sent_dt = datetime.fromisoformat(entry["sent_at"])
+                age_s = (datetime.now() - sent_dt).total_seconds()
+            except Exception:
+                age_s = 9999.0
+            user_msg_id = entry.get("user_msg_id")
+            ph_id = entry.get("placeholder_msg_id")
+            chat_id = entry.get("chat_id")
+            user_text_short = (entry.get("user_text") or "")[:60]
+
+            # Stale → mark lost
+            if age_s > PENDING_MAX_AGE_SEC:
+                log.warning(f"Pending stale (age {age_s:.0f}s, msg={user_text_short!r}) — marking lost")
+                if ph_id and chat_id:
+                    try:
+                        await bot.edit_message_text(
+                            chat_id=chat_id,
+                            message_id=ph_id,
+                            text="❌ 데몬 재기동으로 답변이 유실됐습니다. 다시 보내주세요.",
+                        )
+                    except Exception as e:
+                        log.warning(f"Stale-edit failed: {e}")
+                continue
+
+            # Try jsonl recovery now
+            self._jsonl_offset = entry.get("jsonl_offset", 0)
+            try:
+                text, complete, _ = self._tail_jsonl_since_offset()
+            except Exception as e:
+                log.warning(f"Resume tail failed: {e}")
+                text, complete = ("", False)
+
+            if complete and text:
+                log.info(f"Resume-deliver: {len(text)} chars (msg={user_text_short!r})")
+                try:
+                    chunks = split_message(text)
+                    if ph_id and chat_id:
+                        await bot.edit_message_text(
+                            chat_id=chat_id, message_id=ph_id, text=chunks[0],
+                        )
+                    for ch in chunks[1:]:
+                        await bot.send_message(chat_id=chat_id or CHAT_ID, text=ch)
+                except Exception as e:
+                    log.warning(f"Resume-deliver edit failed: {e}")
+                    survivors.append(entry)
+                continue
+
+            # Not complete yet — keep entry, schedule background polling
+            log.info(f"Resume-poll (background, age {age_s:.0f}s): {user_text_short!r}")
+            survivors.append(entry)
+            asyncio.create_task(self._resume_polling_task(entry, bot))
+
+        data["pending"] = survivors
+        self._write_pending(data)
+
+    async def _resume_polling_task(self, entry: dict, bot) -> None:
+        """Background task that finishes a previously-in-flight reply by
+        waiting for the session jsonl turn to complete, then editing the
+        placeholder. Removes the pending entry on success or on terminal
+        failure (no infinite retry)."""
+        self._jsonl_offset = entry.get("jsonl_offset", 0)
+        try:
+            text = await self._poll_response_via_jsonl(timeout=600.0)
+        except Exception as e:
+            log.warning(f"Background resume poll failed: {e}")
+            text = None
+        if not text:
+            log.warning(f"Background resume gave up empty: {entry.get('user_text','')[:60]!r}")
+            self._clear_pending(entry.get("user_msg_id"))
+            return
+        chat_id = entry.get("chat_id")
+        ph_id = entry.get("placeholder_msg_id")
+        try:
+            chunks = split_message(text)
+            if ph_id and chat_id:
+                await bot.edit_message_text(chat_id=chat_id, message_id=ph_id, text=chunks[0])
+            for ch in chunks[1:]:
+                await bot.send_message(chat_id=chat_id or CHAT_ID, text=ch)
+            log.info(f"Background-resumed delivery {len(text)} chars")
+        except Exception as e:
+            log.warning(f"Background resume edit failed: {e}")
+        finally:
+            self._clear_pending(entry.get("user_msg_id"))
 
     def _send_boot_ready(self, extras: dict = None):
         """Send a one-shot 'ready' Telegram message after bot init completes.
@@ -3778,6 +3943,18 @@ class LiteClaw:
             if claude_idle:
                 sent_msg = await update.message.reply_text("⏳ 작업 중…")
 
+            # Record pending so a daemon restart can resume delivery from the
+            # session jsonl instead of leaving the placeholder stuck.
+            try:
+                self._record_pending(
+                    user_msg_id=update.message.message_id,
+                    placeholder_msg_id=sent_msg.message_id if sent_msg else None,
+                    chat_id=update.effective_chat.id,
+                    user_text=user_text,
+                )
+            except Exception as e:
+                log.warning(f"_record_pending failed (non-fatal): {e}")
+
             # Poll for response with streaming feedback
             response = await self._poll_response(ctx.bot, user_text, pre_snapshot=pre_snapshot)
 
@@ -3831,6 +4008,13 @@ class LiteClaw:
 
             # Deliver response (with persistent retry)
             delivered_msg_id = await self._deliver_response(response, user_text, update, ctx, meta=_conv_meta)
+
+            # Delivery succeeded (or we tried our best) — drop the pending
+            # entry so the next daemon boot doesn't try to re-resume it.
+            try:
+                self._clear_pending(update.message.message_id)
+            except Exception:
+                pass
 
             # Schedule follow-up only when pane-scrape was the source. When the
             # jsonl path returned a complete (`stop_reason=end_turn`) turn,
@@ -5065,6 +5249,12 @@ class LiteClaw:
         async def on_init(app):
             # Cache bot reference for background tasks (e.g. CLI mirror)
             self._bot_ref = app.bot
+            # Resume any pending replies left behind by a previous daemon
+            # instance (crash or graceful restart). See _resume_pending_on_boot.
+            try:
+                await self._resume_pending_on_boot(app)
+            except Exception as e:
+                log.warning(f"Resume-on-boot failed (non-fatal): {e}")
             if self._cron_jobs:
                 self._schedule_cron_jobs(app.job_queue)
                 log.info(f"Cron scheduler initialized with {len(self._cron_jobs)} job(s)")
@@ -5163,7 +5353,16 @@ class LiteClaw:
         # Loop 4 will populate `extras` with resume/primer status; for now this
         # ships the basic ready ping so users know startup completed.
         self._send_boot_ready()
-        app.run_polling(drop_pending_updates=False)
+        # Graceful shutdown: PTB's run_polling handles SIGINT/SIGTERM by
+        # default and tries to finish in-flight handlers before exiting. The
+        # stop_signals tuple is explicit here to make the behavior obvious.
+        # Hard kills (SIGKILL, crash) are covered by the pending-reply resume
+        # path in _resume_pending_on_boot, not by this signal handler.
+        import signal as _signal
+        app.run_polling(
+            drop_pending_updates=False,
+            stop_signals=(_signal.SIGINT, _signal.SIGTERM),
+        )
 
 
 def _is_binary(path: Path) -> bool:

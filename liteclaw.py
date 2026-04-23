@@ -1392,12 +1392,136 @@ class LiteClaw:
             except Exception as e:
                 log.warning(f"Failed to schedule cron job '{job['id']}': {e}")
 
+    async def _run_subprocess_cron(self, job: dict, bot):
+        """Run a cron job that's a plain shell command — no Claude Code.
+
+        Motivation: macOS LaunchAgents with StartCalendarInterval use the
+        `com.apple.UserEventAgent-Aqua` monitor, which silently skips jobs
+        when the GUI session isn't active (display lock, fast-user-switch,
+        etc.). LiteClaw's APScheduler runs inside the always-on daemon and
+        isn't subject to that gate — so time-critical non-LLM jobs are
+        better off here.
+
+        Job schema for subprocess type (in `.cron_jobs.json`):
+            {
+              "id": "...",
+              "enabled": true,
+              "cron_expr": "0 19 * * *",
+              "tz": "Asia/Seoul",
+              "type": "subprocess",
+              "command": "/path/to/venv/bin/python3 -u scripts/foo.py",
+              "project": "~/projects/foo",         # cwd
+              "timeout": 1200,                     # seconds
+              "notify_telegram": true,             # send summary on Telegram
+              "notify_tail_lines": 20              # how many log tail lines
+            }
+        """
+        job_id = job["id"]
+        if job_id in self._cron_running:
+            log.info(f"Subprocess cron '{job_id}' already running, skipping")
+            return
+        self._cron_running.add(job_id)
+        tz = ZoneInfo(job.get("tz", "Asia/Seoul"))
+        started = datetime.now(tz)
+        log.info(f"Subprocess cron '{job_id}' starting at {started.strftime('%H:%M:%S')}")
+
+        cmd = job.get("command", "").strip()
+        cwd = Path(os.path.expanduser(job.get("project", "~")))
+        timeout = int(job.get("timeout", 1200))
+        notify = job.get("notify_telegram", True)
+        tail_n = int(job.get("notify_tail_lines", 20))
+
+        try:
+            if not cmd:
+                raise ValueError("subprocess job has empty `command`")
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                cwd=str(cwd),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(
+                    proc.communicate(), timeout=timeout
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                raise TimeoutError(f"subprocess exceeded {timeout}s")
+            rc = proc.returncode or 0
+            output = (stdout or b"").decode("utf-8", errors="replace").rstrip()
+            elapsed = (datetime.now(tz) - started).total_seconds()
+
+            # Log a short tail locally; don't spam the daemon log with full output
+            tail = "\n".join(output.splitlines()[-tail_n:])
+            log.info(
+                f"Subprocess cron '{job_id}' rc={rc} in {elapsed:.1f}s "
+                f"(tail {len(tail)} chars)"
+            )
+            if rc != 0:
+                raise RuntimeError(f"rc={rc}\n{tail[-2000:]}")
+
+            # Persist job state
+            job["last_run"] = started.isoformat()
+            job["last_status"] = "ok"
+            self._save_cron_jobs()
+
+            if notify:
+                icon = "✅"
+                summary = (
+                    f"{icon} cron `{job_id}` · {elapsed:.0f}s · rc=0\n"
+                    f"```\n{tail[-1500:]}\n```"
+                )
+                try:
+                    await bot.send_message(
+                        chat_id=CHAT_ID, text=summary, parse_mode="Markdown",
+                    )
+                except Exception:
+                    # Markdown sometimes chokes on script output — fall back plain.
+                    try:
+                        await bot.send_message(chat_id=CHAT_ID, text=summary)
+                    except Exception as e:
+                        log.warning(f"Subprocess cron '{job_id}' notify failed: {e}")
+
+        except Exception as e:
+            log.error(f"Subprocess cron '{job_id}' failed: {e}")
+            job["last_run"] = datetime.now(tz).isoformat()
+            job["last_status"] = f"error: {e}"
+            self._save_cron_jobs()
+            try:
+                self._log_cron_error(job_id, job, e, session_name="(subprocess)")
+            except Exception:
+                pass
+            try:
+                await bot.send_message(
+                    chat_id=CHAT_ID,
+                    text=f"❌ cron `{job_id}` failed: {e}",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
+        finally:
+            self._cron_running.discard(job_id)
+
     async def _run_cron_job(self, context):
-        """Execute a single cron job. Called by APScheduler."""
+        """Execute a single cron job. Called by APScheduler.
+
+        Two job types:
+          - (default) `type: "claude"` — spawns a tmux session, runs Claude
+            Code, injects `job["message"]`, polls for response, summarizes
+            and delivers to Telegram. This is the historical LLM path.
+          - `type: "subprocess"` — runs `job["command"]` as a plain shell
+            command under `job["project"]` cwd. Captures combined stdout
+            +stderr, sends a compact summary to Telegram. No Claude, no
+            tmux — useful for jobs that used to live in a LaunchAgent but
+            suffered from macOS Aqua-session gating.
+        """
         job = context.job.data
         job_id = job["id"]
-        session_name = f"cron-{job_id}"
         bot = context.bot
+        if job.get("type", "claude") == "subprocess":
+            return await self._run_subprocess_cron(job, bot)
+        session_name = f"cron-{job_id}"
 
         # Overlap prevention
         if job_id in self._cron_running:

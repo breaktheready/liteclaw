@@ -1,5 +1,57 @@
 # Changelog
 
+## v0.6.1 (2026-04-23) — Daemon-restart resilience, /tell-summarizer, cron + launchd hardening
+
+### Added
+- **Daemon-restart resilience** — user replies no longer disappear when the daemon is restarted mid-poll.
+  - `~/.liteclaw/pending_replies.json` records every user message with a sent placeholder ("⏳ 작업 중…") that hasn't been answered yet (user_msg_id, placeholder_msg_id, chat_id, jsonl offset, sent timestamp, target).
+  - `_resume_pending_on_boot` runs from `Application.post_init`. For each pending entry it either (a) reads the session jsonl and edits the placeholder with the now-completed answer, (b) spawns a background task to finish polling, or (c) marks the placeholder as "재기동으로 유실됨" if older than `PENDING_MAX_AGE_SEC` (default 900 s).
+  - `run_polling` now passes `stop_signals=(SIGINT, SIGTERM)` explicitly so `pkill liteclaw` triggers PTB's graceful drain. Hard kills / crashes are covered by the persistent-pending path.
+  - New env: `PENDING_MAX_AGE_SEC` (default 900).
+- **`/tell-summarizer` command** (alias `/tellsum`) — runtime control over the summarizer system prompt. `/tellsum <instruction>` appends, `/tellsum show` displays, `/tellsum clear` resets. Persists in-memory only (reset on restart).
+- **Battery (2차전지) morning check cron** — new `battery-morning-check` in `.cron_jobs.json` (`55 7 * * 1-5`, Asia/Seoul, 1200 s timeout). Tracks 삼성SDI (006400) and 에코프로 (086520) using the Taihan-Cable checklist pattern (lithium / nickel proxies, TSLA / LCID / RIVN / QS, BYDDY / NIO / LI, IRA / CATL / solid-state news). Reference at `~/.liteclaw/references/battery-morning-checklist.md`.
+- **Community hygiene** — `CONTRIBUTING.md`, `.github/workflows/ci.yml` (AST parse + `bash -n` + requirements import smoke + advisory ruff lint), `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.md`, shields.io badges in both READMEs.
+
+### Fixed
+- **Cron messages still referenced legacy `~/.openclaw/skills/…`** — Claude had to self-recover (search + retry) and hit job timeouts. Replaced with `~/projects/openclaw-archive/skills/…` and `~/projects/openclaw-archive/workspace/scripts/…` in 5 cron jobs (market-coach-{preopen,open,mid,close}, weekly-action-review).
+- **market-coach-* timeouts** 300 → 600 s; `taihan-morning-check` 900 → 1200 s.
+- **`market-coach-preopen` schedule** 08:03 → 07:45 KST so the brief arrives before NXT opens at 08:00.
+- **macOS LaunchAgents firing in the wrong timezone** (e.g. 23:50 KST instead of 07:50) — launchd's user session had no `TZ` cached. Added `~/Library/LaunchAgents/com.breaktheready.setenv-tz.plist` that runs `launchctl setenv TZ Asia/Seoul` at boot. All time-based agents also get `LimitLoadToSessionType = [Aqua, Background, StandardIO, LoginWindow]` so they fire even during display sleep.
+- **`okl-ear-report` daily email never sent on Mac** — hardcoded Linux path for Gmail creds. Switched to `Path.home() / "projects" / "autotrade" / ".env"`. LaunchAgent `ProgramArguments` also got `-u` so Python stdout flushes in real time (was buffered).
+- **OKL Ear daily digest ignored `knowledge.json`** — only `context.md` was injected into the LLM prompt. Added `_load_knowledge_compact()` which curates ~11 KB of team / stakeholders / suppliers / ARP projects / terminology / lexicon into the prompt. Side-by-side: `[불명확]` count 36 → 24, named participants (송병준 / Clara / 영우) now appear correctly.
+
+### Changed
+- **`SUMMARIZE_PROMPT`** gained a **PRESERVE-AS-IS** block — numbered / lettered option lists ("B / C / D 선택") must reach Telegram verbatim. Previously the summarizer kept "Pick one" while dropping the option bodies.
+
+---
+
+## v0.6.0 (2026-04-20 → 2026-04-21) — jsonl response path, session memory, global CLI, cron hardening
+
+(Merged via https://github.com/breaktheready/liteclaw/pull/1)
+
+### Added
+- **Global `liteclaw` CLI** — `liteclaw start|stop|restart|status|logs|attach` from any directory. `setup.sh` installs a symlink at `~/.local/bin/liteclaw`.
+- **Pinned Claude Code session via `--session-id <uuid>`** — `start.sh` allocates / adopts a stable UUID in `~/.liteclaw/sessions.json.liteclaw_session_id` and always resumes the same conversation, unaffected by other Claude Code windows in the same cwd.
+- **JSONL response path** (Phase A) — responses are lifted from Claude Code's own session log (`~/.claude/projects/<encoded-cwd>/<id>.jsonl`) instead of scraping the tmux pane. No ANSI chrome, no scrollback truncation, no summarizer over-compression. Automatic fallback to pane-scrape on jsonl failure.
+- **OpenClaw-style memory layout** (`~/.liteclaw/`) — per-day transcripts, daily markdown digests (LLM-compacted), rolling strategic summary, startup primer. Legacy `~/.liteclaw-history.jsonl` auto-migrates.
+- **Compact session-id alias (`sid`)** in transcripts — integer index into `sessions.json.history[]`, ~70 % shorter per row than embedding the full UUID.
+- **`/recall session [uuid]`** — session-scoped recall.
+- **Boot-ready Telegram ping** — one-shot "🚀 LiteClaw ready" after init, rate-limited to 5 min.
+- **`~/.liteclaw/cron-error-capture.md`** — forensic log of failed cron runs (job config + pane snapshot).
+
+### Fixed
+- **`is_idle_prompt` false-positive** on Claude Code UI chrome ("· Claude Max", "· Share Claude Code…") that jammed the cron busy-wait at 120 s. Removed `·` and `*` from `_SPINNER_CHARS`, anchored `_ACTIVITY_PATTERNS` to line start.
+- **Cron trust prompt** auto-accept in `_run_cron_job` for unattended project dirs.
+- **APScheduler weekday indexing** — `1-5` was Tue-Sat instead of Mon-Fri.
+- **Mid-poll status edits** leaking "Thinking (Crystalizing)…" into Telegram. Gated behind `SHOW_POLLING_STATUS` (off by default).
+- **`_followup_edit` overwriting delivered messages** with stale status edits when jsonl path had already returned a complete turn. Now skipped when `_jsonl_delivered_complete` is set.
+
+### Changed
+- Placeholder text "📤 Sent. Waiting for response…" → "⏳ 작업 중…".
+- `setup.sh` plants sensible `~/.tmux.conf` defaults when missing (mouse on, history-limit 50000).
+
+---
+
 ## v0.5.0 (2026-04-17) — CLI Mirror, Draft Streaming, Reasoning Lane & Skill System
 
 ### Added
